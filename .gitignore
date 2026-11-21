@@ -1,0 +1,3 @@
+# Binary from `go build` / `go build -o ollama-door` in a clone of this repo.
+/ollama-door
+/ollama-door.exe
