@@ -3,7 +3,12 @@
 package ollama
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -28,25 +33,108 @@ func New(baseURL string) *Client {
 	}
 }
 
-// Chat posts req to {BaseURL}/api/chat and returns the final response,
-// the object whose Done field is true.
+// Chat posts req to {BaseURL}/api/chat.
+//
+// The returned Message.Content is the full assistant text: every streamed
+// piece, joined in order. The other fields (Done, timings, model) come
+// from the last object.
 //
 // When req.Stream is true, Ollama writes newline-delimited JSON. onChunk
-// is called for each object, including the final one. A nil onChunk skips
-// that call. When req.Stream is false, Ollama writes one JSON object and
-// onChunk is not called.
+// is called for each object as it arrives, including the final one, with
+// that object's own Message.Content (one piece, not the joined text).
+// A nil onChunk skips that call. When req.Stream is false, Ollama writes
+// one JSON object and onChunk is not called.
 //
 // Cancel ctx to stop a reply that is still streaming.
-//
-// TODO: encode req, POST it, and decode the body as described above.
-// The stub returns a zero ChatResponse and a nil error so the package
-// compiles. Do not call it from main until the body is real.
 func (c *Client) Chat(ctx context.Context, req ChatRequest, onChunk func(ChatResponse) error) (ChatResponse, error) {
-	// Keep the parameters referenced so this stub compiles.
-	// Delete these lines when you write the body.
-	_ = c
-	_ = ctx
-	_ = req
-	_ = onChunk
-	return ChatResponse{}, nil
+	if c == nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: nil client")
+	}
+	if ctx == nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: nil context")
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: encode request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpc := c.HTTP
+	if httpc == nil {
+		httpc = http.DefaultClient
+	}
+	resp, err := httpc.Do(httpReq)
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ChatResponse{}, statusError(resp)
+	}
+	if !req.Stream {
+		var one ChatResponse
+		if err := json.NewDecoder(resp.Body).Decode(&one); err != nil {
+			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w", err)
+		}
+		return one, nil
+	}
+	return readStream(resp.Body, onChunk)
+}
+
+// readStream reads NDJSON. One JSON object per line.
+func readStream(body io.Reader, onChunk func(ChatResponse) error) (ChatResponse, error) {
+	sc := bufio.NewScanner(body)
+	// Scanner stops at 64KiB by default. A single token line can be longer.
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	var full strings.Builder
+	var last ChatResponse
+	saw := false
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var chunk ChatResponse
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w", err)
+		}
+		saw = true
+		full.WriteString(chunk.Message.Content)
+		if onChunk != nil {
+			if err := onChunk(chunk); err != nil {
+				return ChatResponse{}, fmt.Errorf("ollama chat: %w", err)
+			}
+		}
+		last = chunk
+	}
+	if err := sc.Err(); err != nil {
+		return ChatResponse{}, fmt.Errorf("ollama chat: read: %w", err)
+	}
+	if !saw {
+		return ChatResponse{}, fmt.Errorf("ollama chat: empty response")
+	}
+	last.Message.Content = full.String()
+	if last.Message.Role == "" {
+		last.Message.Role = RoleAssistant
+	}
+	return last, nil
+}
+
+func statusError(resp *http.Response) error {
+	slurp, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	msg := strings.TrimSpace(string(slurp))
+	if err != nil {
+		return fmt.Errorf("ollama chat: status %s: %w", resp.Status, err)
+	}
+	if msg == "" {
+		return fmt.Errorf("ollama chat: status %s", resp.Status)
+	}
+	return fmt.Errorf("ollama chat: status %s: %s", resp.Status, msg)
 }

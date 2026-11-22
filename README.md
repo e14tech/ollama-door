@@ -2,9 +2,15 @@
 
 A BBS door that chats with a local [Ollama](https://ollama.com) server.
 
-The pieces are in place and the program builds. The functions that talk
-to Ollama, strip non-ASCII, and wrap lines are stubs with `TODO` bodies.
-The read loop echoes each line so you can run it in a terminal today.
+The caller types a line. The door sends the conversation to Ollama and
+writes the reply as plain ASCII, wrapped to the screen width. Every line
+the caller sees ends with CRLF (`\r\n`).
+
+A BBS launches the door with `-dropfile`, pointing at the `DOOR32.SYS`
+or `DOOR.SYS` it just wrote. That file is the normal way to learn who
+is calling, whether their terminal can do ANSI, and how many minutes
+they have left. `-theme` and `-width` are optional overrides for a local
+test or a sysop tweak.
 
 ## What a BBS door is
 
@@ -22,47 +28,127 @@ The BBS owns the connection. Your job is the conversation.
 Callers on DOS, Apple II, and Commodore 64 terminals need plain bytes:
 
 - **7-bit ASCII only.** Smart quotes and dashes become ASCII punctuation.
-  Emoji and other non-ASCII characters are dropped. See `internal/ascii`.
+  Accented letters become the base letter. Emoji and other non-ASCII
+  characters are dropped. See `internal/ascii`.
 - **Word wrap at 40 or 80 columns.** Apple II and C64 screens are 40
-  columns; a typical DOS terminal is 80. Every line ends with CRLF
+  columns; a typical DOS terminal is 80. A word longer than the width
+  is cut so it cannot run off the screen. Every line ends with CRLF
   (`\r\n`). See `internal/wrap`.
+- **Two themes, no boxes.** `mono` sends no ANSI at all. `green` is a
+  blank bright-green-on-black screen and a cursor. See `internal/theme`.
 - **Chat is HTTP to a local Ollama.** `POST /api/chat`, streaming
   (newline-delimited JSON). See `internal/ollama`.
+- **The drop file is the caller's ID card.** Alias, ANSI, and minutes
+  left. See `internal/dropfile`.
 - **Flags, standard library only.** No third-party modules.
 
 ```
 caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
+                                      dropfile (alias, ANSI, minutes)
+                                              |  theme
                                               |  ascii.Sanitize
-                                              |  wrap.Wrap
+                                              |  wrap
                                               |  ollama.Client.Chat
                                          stdout  ->  BBS  ->  caller
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-host` | `http://localhost:11434` | Ollama base URL |
 | `-model` | (required) | Model name, for example `llama3.2` |
-| `-width` | `80` | Screen width. Pass `-width 40` for a 40-column terminal |
-| `-system` | empty | System prompt, sent once when chat is implemented |
+| `-dropfile` | none | Path to `DOOR32.SYS` or `DOOR.SYS`. This is how a BBS starts the door |
+| `-host` | `http://localhost:11434` | Ollama base URL |
+| `-width` | `80` | Optional column override. Classic terminals use 40 or 80 |
+| `-theme` | from the drop file, else `mono` | Optional override: `mono` or `green` |
+| `-system` | a short sysop prompt | First chat message. The default asks for short plain-ASCII answers |
 
-Today those flags are parsed and the loop echoes. `-model` is required
-so the real chat path has it from the start. Ollama is not contacted yet.
+`-theme` and `-width` are for a local test and for a sysop who wants to
+force a setting. When `-theme` is left off, an ANSI caller (drop file
+emulation, or `GR` in `DOOR.SYS`) gets `green`, and an ASCII caller gets
+`mono`. With no drop file the door uses `mono` and 80 columns, and says
+so on stderr.
+
+A positive minutes-left value in the drop file ends the call when that
+time is up. Zero, or a file that does not include the field, does not
+start a clock.
+
+The screen stays plain. There is no box and no border. `green` clears
+the display, homes the cursor, and leaves the `>` prompt on a black
+screen. `mono` never sends an escape byte, so a dumb terminal or an
+Apple II is safe.
+
+The chat keeps the system message and the last turns, about 20 messages
+in all, so a long call does not grow the request without limit.
+
+## Themes
+
+`mono` is the safe theme. The door writes text and CRLF only.
+
+`green` is a period CRT: bright green on black, using only the original
+16-color SGR codes. The sequence is:
+
+```
+ESC[0;1;32;40m ESC[2J ESC[H ESC[0;1;32;40m
+```
+
+`ESC[0;1;32;40m` means reset, intensity, green foreground, black
+background. The color is set before the clear so the blank screen is
+black, then set again after `ESC[2J` and `ESC[H`. Some terminals forget
+the attribute when they clear. On the way out the door sends `ESC[0m`.
+
+ANSI.SYS, Telix, Qmodem, and the ANSI modes of C64 and Apple terminal
+programs understand these codes. They do not understand 256-color
+(`38;5`) or truecolor (`38;2`). Those sequences show up as garbage, so
+this door never sends them.
+
+## Drop file
+
+The base name picks the format, ignoring case. `door32.sys` and
+`DOOR32.SYS` are the same kind of file. Linux BBSes often write the
+lowercase name and DOS CRLF line endings. Each line is trimmed.
+
+`DOOR32.SYS` (Door32 Revision 1) lines this door reads:
+
+| Line | Field |
+| --- | --- |
+| 7 | Alias |
+| 9 | Minutes left |
+| 10 | Emulation: 0 ASCII, 1 ANSI, 2 Avatar, 3 RIP, 4 Max Graphics |
+
+Emulation 1 through 4 counts as ANSI. The Door32 spec says Avatar, RIP,
+and Max Graphics all have an ANSI fallback. Emulation 0 is `mono`.
+Line 2 is a socket handle, not the caller's name. This door uses stdin
+and stdout, so it does not take that handle.
+
+`DOOR.SYS` (the 52-line GAP / Synchronet file):
+
+| Line | Field |
+| --- | --- |
+| 10 | Full name, used when line 36 is missing or blank |
+| 19 | Minutes left |
+| 20 | Graphics: `GR` is ANSI, `NG` and `7E` are not |
+| 21 | Page length in rows. Not used. Width stays on `-width` |
+| 36 | Alias |
+
+A short file is fine. Missing lines stay empty or zero.
+
+Sources: the Door32 spec mirrored in
+[door32_sys.txt](https://github.com/NuSkooler/ansi-bbs/blob/master/docs/dropfile_formats/door32_sys.txt),
+and the Synchronet [DOOR.SYS](http://wiki.synchro.net/ref:door.sys) page.
 
 ## Layout
 
 ```
-main.go                  flags and the stdin loop
+main.go                  flags, the drop file, and the stdin loop
 internal/ascii/          Sanitize(string) string
-internal/wrap/           Wrap(text string, width int) string
+internal/wrap/           Wrap and LineWriter (CRLF, 40 or 80 columns)
 internal/ollama/         Client, Chat, and the /api/chat JSON types
+internal/theme/          mono and green
+internal/dropfile/       DOOR32.SYS and DOOR.SYS
+examples/door32.sys      a sample drop file for a local test
 ```
 
 `internal` means only this module can import those packages. Each
 package is one job, which keeps `main` small.
-
-Tests in `ascii` and `wrap` are table-driven and call `t.Skip("TODO")`.
-`go test ./...` passes. The cases are the spec: when you implement a
-function, delete the `t.Skip` line and make those cases pass.
 
 ## Build
 
@@ -105,77 +191,136 @@ go test ./...
 `gofmt -l` prints files that differ from gofmt's layout. An empty
 listing means the tree is formatted. Run `gofmt -w .` to fix files.
 
-## Try it locally
+`-model` missing, `-width` below 1, or a `-theme` other than `mono` or
+`green` exits 2 and prints the flag help.
 
-You do not need a running Ollama server yet. The loop echoes.
+## Quick local test
 
-```sh
-go run . -model llama3.2
-```
-
-Type a line and press Enter. The same line comes back, and the cursor
-moves to the next row. End the program with Ctrl-D (Unix) or Ctrl-Z
-then Enter (Windows). That closes stdin, which is also how the BBS
-signals that the caller is gone.
-
-See the CRLF bytes (`0d 0a`) with:
+You need Ollama listening on `http://localhost:11434` and a model pulled.
+`examples/door32.sys` is a small Synchronet-style drop file: alias Josh,
+60 minutes, emulation 1 (ANSI). It uses CRLF, the way a Linux BBS writes
+the file. Because emulation is ANSI, the door picks the green theme
+unless you override it.
 
 ```sh
-printf 'Hello\n' | go run . -model llama3.2 | od -An -tx1
+ollama pull llama3.2
+go run . -model llama3.2 -dropfile examples/door32.sys
 ```
 
-You should see `48 65 6c 6c 6f 0d 0a` (`Hello` followed by CR LF).
+The screen clears to black, the greeting says hello to Josh, and the
+cursor sits at `>`. Type a line and press Enter. The reply is plain
+ASCII, wrapped to 80 columns. End the call with `quit`, `/q`, or `bye`.
+Closing stdin (Ctrl-D on Unix, Ctrl-Z then Enter on Windows) also ends
+it. That is how the BBS signals that the caller is gone.
 
-`Sanitize` and `Wrap` still return their input unchanged, so a Unicode
-character you type is echoed as-is, and a long line is not wrapped yet.
-A status line on stderr shows the flags. It is for you, not for the
-caller's screen:
+A 40-column screen, still using the drop file for the name and the theme:
 
 ```sh
-go run . -model llama3.2 -width 40 -system "You are a door on a BBS."
+go run . -model llama3.2 -dropfile examples/door32.sys -width 40
 ```
 
-`-model` missing exits 2 and prints the flag help.
+Force mono when you want to see the bytes with no color, for example
+under `od`:
 
-Wire the BBS door entry to the `ollama-door` binary when the chat loop
-is real. The BBS starts it with the caller's terminal already connected
-to stdin and stdout.
+```sh
+printf 'quit\n' | go run . -model llama3.2 -dropfile examples/door32.sys -theme mono | od -An -tx1
+```
+
+You should see `0d 0a` (CR LF) at the ends of lines, and no `1b` bytes.
+
+If Ollama is not running, the door prints a short apology and the `>`
+prompt comes back. The details are on stderr. Stderr is for you, not
+for the caller's screen.
+
+Running with no `-dropfile` still works (`mono`, 80 columns). Stderr
+notes that a BBS is expected to pass one.
+
+## Synchronet setup
+
+This is the shape of an external program on Synchronet (including a
+Gentoo install). The field names below are from the Synchronet wiki.
+Menu keystrokes differ by version, so use the pages linked here rather
+than a memorized path. Older SCFG screens label the drop file type
+"Mystic DOOR32.SYS"; current ones say `DOOR32.SYS`.
+
+Add an online program under SCFG → External Programs → Online Programs.
+The settings that matter for this door:
+
+| SCFG field | Value |
+| --- | --- |
+| Start-up Directory | the directory you copied the binary into |
+| Command Line | see below |
+| Native Executable | Yes |
+| I/O Method | Standard |
+| Use Shell or New Context | No |
+| BBS Drop File Type | `DOOR32.SYS` |
+| Place Drop File In | Node Directory |
+
+I/O Method `Standard` connects the caller's terminal to stdin and stdout.
+`Socket` is for a door that takes the TCP handle out of `DOOR32.SYS`
+line 2. This door does not. It reads and writes the standard streams.
+
+Command line, with the binary wherever you installed it:
+
+```
+/home/josh/bin/ollama-door -model llama3.2 -dropfile %F
+```
+
+`%F` is the drop file path. The wiki's Unix example of that specifier
+is `/sbbs/node1/door.sys`. On Linux the name is often lowercase
+(`door32.sys`). The door matches either. `%f` is the same path with
+shell quoting; leave the shell off and use `%F` unless the path has a
+space in it.
+
+To follow the caller's column count, add the width specifier:
+
+```
+/home/josh/bin/ollama-door -model llama3.2 -dropfile %F -width %w
+```
+
+`%w` is the client's terminal width. Leave `-theme` off so the drop
+file picks `green` or `mono`.
+
+Ollama has to be reachable from the BBS host. On the same Gentoo
+machine the default `-host` is enough.
+
+Time Options → Maximum Time caps the minutes Synchronet writes into the
+drop file. The door ends the call when that many minutes pass. Monitor
+Time Left is separate: when it is Yes, Synchronet itself disconnects
+the caller at zero. See the wiki for the rest of that menu.
+
+Docs:
+
+- [Install Doors](http://wiki.synchro.net/howto:door:index)
+- [External Programs](http://wiki.synchro.net/config:external_programs)
+- [Command Lines](http://wiki.synchro.net/config:cmdline) (`%F`, `%w`, and the other specifiers)
+- [DOOR.SYS](http://wiki.synchro.net/ref:door.sys)
 
 ## Your next steps
 
-1. Open `internal/ascii/ascii.go`. Implement `Sanitize` using the rules
-   in the comment (a `map[rune]string` plus a range over the string is
-   enough). In `ascii_test.go`, delete `t.Skip("TODO")`. Run
-   `go test ./internal/ascii`.
-2. Open `internal/wrap/wrap.go`. Implement `Wrap`: split on spaces,
-   fill lines up to `width`, end every line with `\r\n`. Leave a word
-   longer than `width` on one line. An existing newline starts a line,
-   and empty text stays empty. Delete `t.Skip("TODO")` in
-   `wrap_test.go` and run `go test ./internal/wrap`.
-3. Watch a real streamed reply so the JSON matches the structs in
-   `internal/ollama/types.go`:
+The chat loop, sanitizer, wrapper, Ollama client, themes, and drop file
+reader are in place. A few small exercises are left:
 
-   ```sh
-   curl -N http://localhost:11434/api/chat \
-     -H 'Content-Type: application/json' \
-     -d '{"model":"llama3.2","messages":[{"role":"user","content":"hi"}],"stream":true}'
-   ```
+1. **Idle timeout.** If the caller types nothing for a few minutes, say
+   goodbye and exit. `bufio.Scanner` does not have a timeout. Read stdin
+   with a deadline, or start a timer that cancels the context you pass
+   to `Chat`. Synchronet's Maximum Inactivity is the BBS-side version of
+   the same idea.
+2. **Node number.** `DOOR32.SYS` line 11 is the node. Read it in
+   `internal/dropfile` and add `Node 1` to the greeting.
+3. **A strict zero.** `MinutesLeft == 0` currently means "no clock",
+   which is also what a missing line looks like. A BBS can write 0 to
+   mean the caller is already out of time. Tell those two cases apart
+   (a bool next to the int is enough) and hang up on a real zero.
 
-   Each line is one `ChatResponse`. The last line has `"done": true`.
-4. Fill in `Client.Chat` in `internal/ollama/ollama.go`. POST the JSON
-   to `{BaseURL}/api/chat` with `net/http` and `encoding/json`. Honor
-   `ctx`. On a stream, read line by line (`bufio.Scanner` or
-   `bufio.Reader`) and call `onChunk`. Return the final object.
-5. Replace the echo in `main.go` with the chat loop described in the
-   TODO: keep a `[]ollama.Message`, send `-system` once as
-   `ollama.RoleSystem`, and write each chunk through `ascii.Sanitize`
-   and `wrap.Wrap`. Run a short conversation with `go run . -model ...`.
-6. From the repo root, run `gofmt -w .`, `go vet ./...`, `go test ./...`,
-   and `CGO_ENABLED=0 go build -o ollama-door .`.
+Run a short conversation when you want to see the whole path:
 
-Later, if you want the caller's name from the BBS, read its drop file
-(`door.sys` or `door32.sys`) and add that name to the system prompt.
-The door still reads the caller on stdin.
+```sh
+go run . -model llama3.2 -dropfile examples/door32.sys
+```
+
+From the repo root, `gofmt -w .`, `go vet ./...`, `go test ./...`, and
+`CGO_ENABLED=0 go build -o ollama-door .` should all succeed.
 
 ## License
 
