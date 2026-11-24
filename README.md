@@ -60,6 +60,7 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-width` | `80` | Optional column override. Classic terminals use 40 or 80 |
 | `-theme` | from the drop file, else `mono` | Optional override: `mono` or `green` |
 | `-idle` | `5m` | Hang up if the caller types nothing for this long. `0` turns it off |
+| `-maxmin` | `0` | Cap the session minutes. `0` uses the drop file only |
 | `-system` | a short sysop prompt | First chat message. The default asks for short plain-ASCII answers |
 
 `-theme` and `-width` are for a local test and for a sysop who wants to
@@ -68,9 +69,16 @@ emulation, or `GR` in `DOOR.SYS`) gets `green`, and an ASCII caller gets
 `mono`. With no drop file the door uses `mono` and 80 columns, and says
 so on stderr.
 
-A positive minutes-left value in the drop file ends the call when that
-time is up. Zero, or a file that does not include the field, does not
-start a clock.
+The drop file's minutes field is the session clock. `HasLimit` is set
+only when that line is present, so `0` means the caller is already out
+of time, and a missing line means there is no clock. No `-dropfile` is
+the same as no clock. The door warns once at 5 minutes left and again
+at 1 minute left, and only while the `>` prompt is waiting. At zero it
+prints `Your time is up. Returning to the BBS...` and exits. A reply
+that is already streaming is allowed to finish; the session deadline
+does not cancel that HTTP call. `-maxmin 30` caps a longer drop-file
+budget at 30 minutes. `-maxmin 0` leaves the drop file in charge. If
+the file has no limit, a positive `-maxmin` is the whole budget.
 
 `-idle` is a second clock, and it runs only while the `>` prompt is
 waiting for a line. A long Ollama reply does not count. The default is
@@ -316,10 +324,9 @@ reader, and idle hangup are in place. A few small exercises are left:
    limit warns 30 seconds ahead, and add a row to `TestIdleWaits`.
 2. **Node number.** `DOOR32.SYS` line 11 is the node. Read it in
    `internal/dropfile` and add `Node 1` to the greeting.
-3. **A strict zero.** `MinutesLeft == 0` currently means "no clock",
-   which is also what a missing line looks like. A BBS can write 0 to
-   mean the caller is already out of time. Tell those two cases apart
-   (a bool next to the int is enough) and hang up on a real zero.
+3. **`/time`.** When the caller types `/time`, print how many minutes
+   are left on the session clock. `HasLimit` false means there is no
+   clock to show.
 
 Run a short conversation when you want to see the whole path:
 

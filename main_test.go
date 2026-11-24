@@ -8,11 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/e14tech/ollama-door/internal/dropfile"
 	"github.com/e14tech/ollama-door/internal/ollama"
 	"github.com/e14tech/ollama-door/internal/theme"
 )
@@ -51,13 +54,62 @@ func TestPickTheme(t *testing.T) {
 	}
 }
 
-func TestDeadlineFromMinutes(t *testing.T) {
-	if !deadlineFromMinutes(0).IsZero() {
-		t.Fatal("zero minutes should not set a deadline")
+func TestSessionDeadline(t *testing.T) {
+	if !sessionDeadline(60, false).IsZero() {
+		t.Fatal("no limit should not set a deadline")
 	}
-	d := deadlineFromMinutes(1)
+	zero := sessionDeadline(0, true)
+	if zero.IsZero() || zero.After(time.Now()) {
+		t.Fatalf("a limit of 0 should already be due, got %v", zero)
+	}
+	d := sessionDeadline(1, true)
 	if d.Before(time.Now()) || d.After(time.Now().Add(2*time.Minute)) {
 		t.Fatalf("deadline %v", d)
+	}
+}
+
+func TestApplyMaxMin(t *testing.T) {
+	tests := []struct {
+		name    string
+		info    dropfile.Info
+		max     int
+		minutes int
+		limited bool
+	}{
+		{name: "none", max: 0},
+		{name: "cap only", max: 10, minutes: 10, limited: true},
+		{name: "file only", info: dropfile.Info{MinutesLeft: 60, HasLimit: true}, minutes: 60, limited: true},
+		{name: "cap lower", info: dropfile.Info{MinutesLeft: 60, HasLimit: true}, max: 10, minutes: 10, limited: true},
+		{name: "file lower", info: dropfile.Info{MinutesLeft: 5, HasLimit: true}, max: 10, minutes: 5, limited: true},
+		{name: "zero stays", info: dropfile.Info{HasLimit: true}, max: 30, limited: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, limited := applyMaxMin(tt.info, tt.max)
+			if got != tt.minutes || limited != tt.limited {
+				t.Fatalf("applyMaxMin = %d, %v", got, limited)
+			}
+		})
+	}
+}
+
+func TestSessionWarns(t *testing.T) {
+	tests := []struct {
+		minutes       int
+		five, one     time.Duration
+		fiveOn, oneOn bool
+	}{
+		{minutes: 0},
+		{minutes: 1},
+		{minutes: 5, one: 4 * time.Minute, oneOn: true},
+		{minutes: 6, five: time.Minute, fiveOn: true, one: 5 * time.Minute, oneOn: true},
+		{minutes: 10, five: 5 * time.Minute, fiveOn: true, one: 9 * time.Minute, oneOn: true},
+	}
+	for _, tt := range tests {
+		five, one, fiveOn, oneOn := sessionWarns(tt.minutes)
+		if five != tt.five || one != tt.one || fiveOn != tt.fiveOn || oneOn != tt.oneOn {
+			t.Fatalf("minutes %d: %s %v, %s %v", tt.minutes, five, fiveOn, one, oneOn)
+		}
 	}
 }
 
@@ -304,7 +356,7 @@ func TestRunTimeAlreadyUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "Your time is up. Goodbye.\r\n") {
+	if !strings.Contains(out.String(), "Your time is up. Returning to the BBS...\r\n") {
 		t.Fatalf("out %q", out.String())
 	}
 	if strings.Contains(out.String(), "> ") {
@@ -312,33 +364,35 @@ func TestRunTimeAlreadyUp(t *testing.T) {
 	}
 }
 
-// deadlineTripper stands in for a chat call that the context stopped.
-type deadlineTripper struct{}
-
-func (deadlineTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, context.DeadlineExceeded
-}
-
 func TestRunTimeUpDuringChat(t *testing.T) {
-	client := ollama.New("http://ollama.invalid")
-	client.HTTP = &http.Client{Transport: deadlineTripper{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"pong\"},\"done\":true}\n")
+	}))
+	defer srv.Close()
+
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
 	var out, errOut bytes.Buffer
 	err := run(context.Background(), strings.NewReader("hi\n"), &out, &errOut, session{
 		client:   client,
 		model:    "m",
 		theme:    theme.Mono,
-		width:    40,
-		deadline: time.Now().Add(time.Minute),
+		width:    80,
 		minutes:  1,
+		deadline: time.Now().Add(40 * time.Millisecond),
 	})
 	if err != nil {
 		t.Fatalf("run: %v, stderr %q", err, errOut.String())
 	}
-	if !strings.Contains(out.String(), "Your time is up. Goodbye.\r\n") {
-		t.Fatalf("out %q stderr %q", out.String(), errOut.String())
+	text := out.String()
+	pong := strings.Index(text, "pong\r\n")
+	up := strings.Index(text, "Your time is up. Returning to the BBS...")
+	if pong < 0 || up < 0 || pong > up {
+		t.Fatalf("out %q stderr %q", text, errOut.String())
 	}
-	if strings.Contains(out.String(), "not answering") {
-		t.Fatalf("time-up looked like an Ollama failure: %q", out.String())
+	if strings.Contains(text, "not answering") {
+		t.Fatalf("a finished reply looked like an Ollama failure: %q", text)
 	}
 }
 
@@ -574,6 +628,228 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func TestSessionTimeUpAtPrompt(t *testing.T) {
+	themes := []theme.Theme{theme.Mono, theme.Green}
+	for _, th := range themes {
+		t.Run(th.Name, func(t *testing.T) {
+			r, w := io.Pipe()
+			defer w.Close()
+			var out bytes.Buffer
+			start := time.Now()
+			err := run(context.Background(), r, &out, io.Discard, session{
+				theme:    th,
+				width:    80,
+				minutes:  1,
+				deadline: time.Now().Add(40 * time.Millisecond),
+				idle:     time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if time.Since(start) > time.Second {
+				t.Fatalf("waited %s", time.Since(start))
+			}
+			text := out.String()
+			if !strings.Contains(text, "\r\nYour time is up. Returning to the BBS...\r\n") {
+				t.Fatalf("out %q", text)
+			}
+			if strings.Contains(text, "Idle too long") {
+				t.Fatalf("idle won over the session clock: %q", text)
+			}
+			if !strings.HasPrefix(text, th.Start) || !strings.HasSuffix(text, th.End) {
+				t.Fatalf("theme missing around time-up: %q", text)
+			}
+			wantEsc := strings.Count(th.Start, "\x1b") + strings.Count(th.End, "\x1b")
+			if got := strings.Count(text, "\x1b"); got != wantEsc {
+				t.Fatalf("escape count %d, want %d", got, wantEsc)
+			}
+		})
+	}
+}
+
+func TestIdleSoonerThanSession(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	var out bytes.Buffer
+	err := run(context.Background(), r, &out, io.Discard, session{
+		theme:    theme.Mono,
+		width:    80,
+		minutes:  1,
+		deadline: time.Now().Add(2 * time.Second),
+		idle:     30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Idle too long. Goodbye!") {
+		t.Fatalf("out %q", text)
+	}
+	if strings.Contains(text, "Returning to the BBS") {
+		t.Fatalf("session clock won over idle: %q", text)
+	}
+}
+
+func TestZeroMinutesExitsImmediately(t *testing.T) {
+	var out bytes.Buffer
+	err := run(context.Background(), strings.NewReader("hi\n"), &out, io.Discard, session{
+		theme:    theme.Mono,
+		width:    80,
+		deadline: sessionDeadline(0, true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Your time is up. Returning to the BBS...\r\n") {
+		t.Fatalf("out %q", text)
+	}
+	if strings.Contains(text, "> ") {
+		t.Fatalf("prompted a caller with 0 minutes: %q", text)
+	}
+}
+
+func TestSessionWarnings(t *testing.T) {
+	fiveCh := make(chan time.Time)
+	oneCh := make(chan time.Time)
+	r, w := io.Pipe()
+	defer w.Close()
+
+	var got lockedBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(context.Background(), r, &got, io.Discard, session{
+			theme:    theme.Mono,
+			width:    80,
+			minutes:  10,
+			deadline: time.Now().Add(10 * time.Minute),
+			after: func(d time.Duration) <-chan time.Time {
+				switch d {
+				case 5 * time.Minute:
+					return fiveCh
+				case 9 * time.Minute:
+					return oneCh
+				default:
+					return make(chan time.Time)
+				}
+			},
+		})
+	}()
+
+	waitFor(t, got.String, "> ")
+	fiveCh <- time.Now()
+	waitFor(t, got.String, "\r\n5 minutes left.\r\n")
+	if strings.Contains(got.String(), "1 minute left.") {
+		t.Fatalf("1 minute warning came early: %q", got.String())
+	}
+	oneCh <- time.Now()
+	waitFor(t, got.String, "\r\n1 minute left.\r\n")
+	if strings.Contains(got.String(), "Returning to the BBS") {
+		t.Fatalf("time ran out during the warnings: %q", got.String())
+	}
+	if strings.Contains(got.String(), "\x1b") {
+		t.Fatalf("warnings contained an escape: %q", got.String())
+	}
+	io.WriteString(w, "quit\n")
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
+	}
+}
+
+func TestSessionWarningAfterReply(t *testing.T) {
+	fiveCh := make(chan time.Time)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"pong\"},\"done\":true}\n")
+	}))
+	defer srv.Close()
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+
+	r, w := io.Pipe()
+	defer w.Close()
+	go func() {
+		io.WriteString(w, "hello\n")
+	}()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		fiveCh <- time.Now()
+	}()
+
+	var got lockedBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(context.Background(), r, &got, io.Discard, session{
+			client:   client,
+			model:    "m",
+			theme:    theme.Mono,
+			width:    80,
+			minutes:  10,
+			deadline: time.Now().Add(10 * time.Minute),
+			after: func(d time.Duration) <-chan time.Time {
+				if d == 5*time.Minute {
+					return fiveCh
+				}
+				return make(chan time.Time)
+			},
+		})
+	}()
+
+	waitFor(t, got.String, "5 minutes left.")
+	text := got.String()
+	pong := strings.Index(text, "pong\r\n")
+	note := strings.Index(text, "5 minutes left.")
+	if pong < 0 || note < 0 || pong > note {
+		t.Fatalf("out %q", text)
+	}
+	w.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
+	}
+}
+
+func TestRealMainZeroMinutes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "door32.sys")
+	body := "2\n0\n38400\nSynchronet\n1\nJosh\nJosh\n10\n0\n1\n1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := realMain([]string{"-model", "m", "-theme", "mono", "-idle", "0", "-dropfile", path}, strings.NewReader("hi\n"), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("code %d, stderr %q", code, errOut.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "Your time is up. Returning to the BBS...\r\n") {
+		t.Fatalf("out %q", text)
+	}
+	if strings.Contains(text, "> ") {
+		t.Fatalf("prompted: %q", text)
+	}
+}
+
+func TestRealMainMaxMinNegative(t *testing.T) {
+	var errOut bytes.Buffer
+	code := realMain([]string{"-model", "m", "-maxmin", "-1"}, strings.NewReader(""), io.Discard, &errOut)
+	if code != 2 {
+		t.Fatalf("code %d, stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "-maxmin must be 0 or positive") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
 }
 
 func waitFor(t *testing.T, got func() string, sub string) {

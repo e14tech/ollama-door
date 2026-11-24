@@ -16,6 +16,11 @@ type Info struct {
 	Alias       string
 	ANSI        bool
 	MinutesLeft int
+	// HasLimit is true when the file included a minutes field, even if
+	// that field is 0. Zero with HasLimit means the caller is out of time.
+	// A missing line leaves HasLimit false, which means no session clock.
+	// No drop file at all is the same idea, and never reaches Parse.
+	HasLimit bool
 }
 
 // Parse reads a DOOR32.SYS or DOOR.SYS file. The format comes from the
@@ -63,15 +68,19 @@ func field(lines []string, n int) string {
 	return lines[n-1]
 }
 
-func atoiField(s string) int {
+// parseMinutes reads a minutes field.
+// An empty line is "not present". A non-negative integer is a real limit,
+// including 0. Garbage and negatives are ignored so a bad line does not
+// kick the caller off.
+func parseMinutes(s string) (n int, ok bool) {
 	if s == "" {
-		return 0
+		return 0, false
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
-		return 0
+		return 0, false
 	}
-	return n
+	return n, true
 }
 
 // parseDoor32 reads Door32 Revision 1 (February 23, 2001).
@@ -89,6 +98,7 @@ func atoiField(s string) int {
 // The spec says Avatar, RIP, and Max Graphics all have an ANSI fallback,
 // so emulation 1 through 4 sets ANSI. Emulation 0 stays ASCII.
 // A short file is fine: missing lines stay at the zero value.
+// Line 9 is the minutes limit only when that line is present.
 // Line 2 is not the caller's alias. The alias is line 7.
 func parseDoor32(lines []string) Info {
 	ansi := false
@@ -96,10 +106,12 @@ func parseDoor32(lines []string) Info {
 	case "1", "2", "3", "4":
 		ansi = true
 	}
+	mins, has := parseMinutes(field(lines, 9))
 	return Info{
 		Alias:       field(lines, 7),
 		ANSI:        ansi,
-		MinutesLeft: atoiField(field(lines, 9)),
+		MinutesLeft: mins,
+		HasLimit:    has,
 	}
 }
 
@@ -120,15 +132,19 @@ func parseDoor32(lines []string) Info {
 // Line 20 is the graphics mode. GR means the caller can do ANSI.
 // NG and 7E (7-bit, even parity) stay ASCII.
 // A 31-line file, or a 52-line file with a blank line 36, has no alias
-// on line 36. The name on line 10 is used then. Other missing lines stay zero.
+// on line 36. The name on line 10 is used then.
+// Line 19 is the minutes limit only when that line is present.
+// A short file simply has no session clock.
 func parseDoorSys(lines []string) Info {
 	alias := field(lines, 36)
 	if alias == "" {
 		alias = field(lines, 10)
 	}
+	mins, has := parseMinutes(field(lines, 19))
 	return Info{
 		Alias:       alias,
 		ANSI:        strings.EqualFold(field(lines, 20), "GR"),
-		MinutesLeft: atoiField(field(lines, 19)),
+		MinutesLeft: mins,
+		HasLimit:    has,
 	}
 }

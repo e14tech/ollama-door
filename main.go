@@ -72,6 +72,7 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 	width := fs.Int("width", 80, "optional column override for a local test; classic terminals use 40 or 80")
 	themeName := fs.String("theme", "mono", "optional theme override: mono or green (default: from the drop file)")
 	idle := fs.Duration("idle", 5*time.Minute, "hang up if the caller types nothing for this long; 0 disables")
+	maxMin := fs.Int("maxmin", 0, "cap session minutes for a sysop; 0 uses the drop file only")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -91,6 +92,11 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 	}
 	if *idle < 0 {
 		fmt.Fprintf(errOut, "ollama-door: -idle must be 0 or positive\r\n")
+		fs.Usage()
+		return 2
+	}
+	if *maxMin < 0 {
+		fmt.Fprintf(errOut, "ollama-door: -maxmin must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
@@ -121,11 +127,12 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
 	client := ollama.New(*host)
-	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s\r\n",
-		*model, client.BaseURL, *width, th.Name, *idle)
-	if dropOK {
-		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d ansi=%t\r\n",
-			alias, info.MinutesLeft, info.ANSI)
+	minutes, limited := applyMaxMin(info, *maxMin)
+	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s maxmin=%d\r\n",
+		*model, client.BaseURL, *width, th.Name, *idle, *maxMin)
+	if dropOK || limited {
+		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t\r\n",
+			alias, minutes, limited, info.ANSI)
 	}
 
 	s := session{
@@ -135,8 +142,8 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 		width:    *width,
 		theme:    th,
 		alias:    alias,
-		minutes:  info.MinutesLeft,
-		deadline: deadlineFromMinutes(info.MinutesLeft),
+		minutes:  minutes,
+		deadline: sessionDeadline(minutes, limited),
 		idle:     *idle,
 	}
 	if err := run(context.Background(), in, out, errOut, s); err != nil {
@@ -189,18 +196,68 @@ func withCaller(system, alias string) string {
 	return system + " " + note
 }
 
-// deadlineFromMinutes returns when the call should end.
-// Zero (a missing line, or a drop file that did not set a budget) means
-// no cap. A positive value is the minutes field from the drop file.
-func deadlineFromMinutes(minutes int) time.Time {
-	if minutes <= 0 {
+// applyMaxMin turns a drop-file limit and the -maxmin cap into one budget.
+// maxMin 0 means "no cap". A drop file with HasLimit and 0 minutes stays
+// at 0, which is already out of time. No drop-file limit plus a positive
+// cap uses the cap. Neither one means there is no session clock.
+func applyMaxMin(info dropfile.Info, maxMin int) (minutes int, limited bool) {
+	if info.HasLimit {
+		minutes = info.MinutesLeft
+		if maxMin > 0 && minutes > maxMin {
+			minutes = maxMin
+		}
+		return minutes, true
+	}
+	if maxMin > 0 {
+		return maxMin, true
+	}
+	return 0, false
+}
+
+// sessionDeadline is when the call must end.
+// limited false returns the zero time, which means "no deadline".
+// A limit of 0 returns the current time, so the context is already done.
+func sessionDeadline(minutes int, limited bool) time.Time {
+	if !limited {
 		return time.Time{}
+	}
+	if minutes < 0 {
+		minutes = 0
 	}
 	return time.Now().Add(time.Duration(minutes) * time.Minute)
 }
 
+// sessionContext is the clock for one visit.
+// A zero deadline is "no limit", so the context is only canceled when
+// the parent is. A real deadline becomes context.WithDeadline.
+func sessionContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithCancel(parent)
+	}
+	return context.WithDeadline(parent, deadline)
+}
+
+func sessionOver(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
 func pastDeadline(deadline time.Time) bool {
 	return !deadline.IsZero() && !time.Now().Before(deadline)
+}
+
+// sessionWarns says when to mention 5 minutes left and 1 minute left.
+// A visit that starts at or below a mark does not warn for that mark,
+// because the moment has already passed.
+func sessionWarns(minutes int) (five, one time.Duration, fiveOn, oneOn bool) {
+	if minutes > 5 {
+		five = time.Duration(minutes-5) * time.Minute
+		fiveOn = true
+	}
+	if minutes > 1 {
+		one = time.Duration(minutes-1) * time.Minute
+		oneOn = true
+	}
+	return five, one, fiveOn, oneOn
 }
 
 func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) error {
@@ -212,9 +269,16 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	if err := writeBanner(out, s.alias, s.minutes, s.width); err != nil {
 		return err
 	}
-	if pastDeadline(s.deadline) {
-		_, err := io.WriteString(out, "Your time is up. Goodbye.\r\n")
-		return err
+	// sessCtx ends when the drop-file clock runs out. Chat does not use
+	// it, so a reply that is already streaming is allowed to finish.
+	// The select below is what notices the deadline, and only while the
+	// prompt is waiting.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sessCtx, sessCancel := sessionContext(ctx, s.deadline)
+	defer sessCancel()
+	if sessionOver(sessCtx) {
+		return writeTimeUp(out, false)
 	}
 
 	var history []ollama.Message
@@ -225,8 +289,6 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	// Cancel tells the reader goroutine to stop sending when this call ends.
 	// Scanner itself stays blocked until the next byte, which is fine:
 	// the process is about to exit, and tests close the pipe.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	lines := readLines(ctx, in)
 
 	prompt := func() error {
@@ -236,12 +298,20 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	if err := prompt(); err != nil {
 		return err
 	}
-	// The idle timers start here, at the prompt, and are replaced after
-	// every line. They are not watched while takeTurn is streaming.
+	// Idle timers are replaced after every line. Session warnings are
+	// armed once, from the start of the call, and stay in this select.
+	// Neither set is read while takeTurn is streaming.
 	stop, warn := s.armIdle()
+	left5, left1 := s.armSession()
 
 	for {
 		select {
+		case <-sessCtx.Done():
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
+			}
+			return sessCtx.Err()
+
 		case ev, ok := <-lines:
 			if !ok {
 				return nil
@@ -249,9 +319,8 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			if ev.err != nil {
 				return ev.err
 			}
-			if pastDeadline(s.deadline) {
-				_, err := io.WriteString(out, "Your time is up. Goodbye.\r\n")
-				return err
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
 			}
 			line := strings.TrimSpace(ev.text)
 			if line == "" {
@@ -275,9 +344,10 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			}
 			var err error
 			history, err = s.takeTurn(ctx, out, errOut, history, line)
-			if errors.Is(err, errTimeUp) {
-				_, werr := io.WriteString(out, "Your time is up. Goodbye.\r\n")
-				return werr
+			// A reply in progress is not cut off. When it returns, the
+			// session clock may already have run out.
+			if errors.Is(err, errTimeUp) || sessionOver(sessCtx) {
+				return writeTimeUp(out, false)
 			}
 			if err != nil {
 				return err
@@ -287,11 +357,37 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			}
 			stop, warn = s.armIdle()
 
+		case <-left1:
+			left1 = nil
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
+			}
+			if err := writeNotice(out, "1 minute left."); err != nil {
+				return err
+			}
+			if err := prompt(); err != nil {
+				return err
+			}
+
+		case <-left5:
+			left5 = nil
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
+			}
+			if err := writeNotice(out, "5 minutes left."); err != nil {
+				return err
+			}
+			if err := prompt(); err != nil {
+				return err
+			}
+
 		case <-warn:
-			// One warning per wait. The stop timer keeps running.
-			// The prompt is still on its row, so the warning starts on the next one.
+			// One idle warning per wait. The stop timer keeps running.
 			warn = nil
-			if _, err := io.WriteString(out, "\r\nStill there? One minute left.\r\n"); err != nil {
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
+			}
+			if err := writeNotice(out, "Still there? One minute left."); err != nil {
 				return err
 			}
 			if err := prompt(); err != nil {
@@ -299,10 +395,31 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			}
 
 		case <-stop:
+			if sessionOver(sessCtx) {
+				return writeTimeUp(out, true)
+			}
 			_, err := io.WriteString(out, "\r\nIdle too long. Goodbye!\r\n")
 			return err
 		}
 	}
+}
+
+// writeTimeUp tells the caller the BBS clock has run out.
+// atPrompt is true when "> " is still sitting on the current row.
+func writeTimeUp(out io.Writer, atPrompt bool) error {
+	text := "Your time is up. Returning to the BBS...\r\n"
+	if atPrompt {
+		text = "\r\n" + text
+	}
+	_, err := io.WriteString(out, text)
+	return err
+}
+
+// writeNotice prints one status line under the prompt and leaves the
+// cursor ready for prompt() to draw "> " again.
+func writeNotice(out io.Writer, text string) error {
+	_, err := io.WriteString(out, "\r\n"+text+"\r\n")
+	return err
 }
 
 // lineEvent is one read from the caller.
@@ -368,6 +485,18 @@ func (s session) armIdle() (stop, warn <-chan time.Time) {
 	return stop, warn
 }
 
+// armSession starts the 5-minute and 1-minute warnings once per call.
+func (s session) armSession() (five, one <-chan time.Time) {
+	fiveFor, oneFor, fiveOn, oneOn := sessionWarns(s.minutes)
+	if fiveOn {
+		five = s.wakeAfter(fiveFor)
+	}
+	if oneOn {
+		one = s.wakeAfter(oneFor)
+	}
+	return five, one
+}
+
 func (s session) wakeAfter(d time.Duration) <-chan time.Time {
 	if s.after != nil {
 		return s.after(d)
@@ -418,16 +547,11 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	history = append(history, ollama.Message{Role: ollama.RoleUser, Content: line})
 	history = trimHistory(history)
 
-	reqCtx := ctx
-	if !s.deadline.IsZero() {
-		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithDeadline(ctx, s.deadline)
-		defer cancel()
-	}
-
+	// ctx is canceled when the call returns, not when the session clock
+	// runs out. The reply in progress is allowed to finish.
 	lw := wrap.NewLineWriter(out, s.width)
 	var spoken strings.Builder
-	_, err := s.client.Chat(reqCtx, ollama.ChatRequest{
+	_, err := s.client.Chat(ctx, ollama.ChatRequest{
 		Model:    s.model,
 		Messages: history,
 		Stream:   true,
@@ -439,9 +563,6 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	})
 	flushErr := lw.Flush()
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return history, errTimeUp
-		}
 		// The model did not finish, so this turn is forgotten.
 		history = history[:len(history)-1]
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
