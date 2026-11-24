@@ -89,6 +89,18 @@ limit is reached it prints `Idle too long. Goodbye!` and exits.
 Synchronet also has Maximum Inactivity, which hangs up the socket from
 the BBS side. `-idle` is the door's own wait.
 
+## Hangups
+
+EOF on stdin, a failed read, a failed write on stdout (`EPIPE` or
+`EIO`), and `SIGHUP`, `SIGINT`, or `SIGTERM` end the call with status 0
+and no goodbye. Nobody is left to read one. If a reply is streaming,
+that HTTP request is canceled. The session clock does not cancel it.
+
+The line reader is a goroutine. It exits when the read returns, or when
+it is waiting to hand off a line and the hangup context is canceled. A
+read blocked in the kernel ends when stdin is closed, which is what the
+BBS does when the carrier drops.
+
 The screen stays plain. There is no box and no border. `green` clears
 the display, homes the cursor, and leaves the `>` prompt on a black
 screen. `mono` never sends an escape byte, so a dumb terminal or an

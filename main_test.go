@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -148,7 +149,7 @@ func TestTrimHistoryNoSystem(t *testing.T) {
 
 func TestRealMainRequiresModel(t *testing.T) {
 	var errOut bytes.Buffer
-	code := realMain(nil, strings.NewReader(""), io.Discard, &errOut)
+	code := realMain(context.Background(), nil, strings.NewReader(""), io.Discard, &errOut)
 	if code != 2 {
 		t.Fatalf("code %d", code)
 	}
@@ -159,7 +160,7 @@ func TestRealMainRequiresModel(t *testing.T) {
 
 func TestRealMainBadTheme(t *testing.T) {
 	var errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-theme", "amber"}, strings.NewReader(""), io.Discard, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-theme", "amber"}, strings.NewReader(""), io.Discard, &errOut)
 	if code != 2 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}
@@ -170,7 +171,7 @@ func TestRealMainBadTheme(t *testing.T) {
 
 func TestRealMainNoDropfileNote(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-theme", "mono"}, strings.NewReader("quit\n"), &out, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-theme", "mono"}, strings.NewReader("quit\n"), &out, &errOut)
 	if code != 0 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}
@@ -187,7 +188,7 @@ func TestRealMainNoDropfileNote(t *testing.T) {
 
 func TestRealMainBadDropfileContinues(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "m", "-theme", "mono", "-dropfile", "missing-door32.sys"},
 		strings.NewReader("/q\n"),
 		&out, &errOut,
@@ -205,7 +206,7 @@ func TestRealMainBadDropfileContinues(t *testing.T) {
 
 func TestRealMainGreenFromDropfile(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "m", "-dropfile", "examples/door32.sys"},
 		strings.NewReader("bye\n"),
 		&out, &errOut,
@@ -233,7 +234,7 @@ func TestRealMainGreenFromDropfile(t *testing.T) {
 
 func TestRealMainThemeOverride(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "m", "-dropfile", "examples/door32.sys", "-theme", "mono"},
 		strings.NewReader("QUIT\n"),
 		&out, &errOut,
@@ -251,7 +252,7 @@ func TestRealMainThemeOverride(t *testing.T) {
 
 func TestRealMainASCIIDropfile(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "m", "-dropfile", "internal/dropfile/testdata/ascii/door32.sys"},
 		strings.NewReader("\n  \nBye\n"),
 		&out, &errOut,
@@ -288,7 +289,7 @@ func TestRealMainChat(t *testing.T) {
 	defer srv.Close()
 
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "llama3.2", "-host", srv.URL, "-theme", "mono", "-width", "80", "-dropfile", "examples/door32.sys"},
 		strings.NewReader("hello\nquit\n"),
 		&out, &errOut,
@@ -328,7 +329,7 @@ func TestRealMainOllamaErrorContinues(t *testing.T) {
 	defer srv.Close()
 
 	var out, errOut bytes.Buffer
-	code := realMain(
+	code := realMain(context.Background(),
 		[]string{"-model", "m", "-host", srv.URL, "-theme", "mono"},
 		strings.NewReader("hi\nbye\n"),
 		&out, &errOut,
@@ -373,8 +374,15 @@ func TestRunTimeUpDuringChat(t *testing.T) {
 
 	client := ollama.New(srv.URL)
 	client.HTTP = srv.Client()
+	// Keep stdin open. Closing it would be a hangup and would cancel
+	// the reply, which is not what the session clock does.
+	r, w := io.Pipe()
+	defer w.Close()
+	go func() {
+		io.WriteString(w, "hi\n")
+	}()
 	var out, errOut bytes.Buffer
-	err := run(context.Background(), strings.NewReader("hi\n"), &out, &errOut, session{
+	err := run(context.Background(), r, &out, &errOut, session{
 		client:   client,
 		model:    "m",
 		theme:    theme.Mono,
@@ -589,7 +597,7 @@ func TestRealMainIdleFlag(t *testing.T) {
 	r, w := io.Pipe()
 	defer w.Close()
 	var out, errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-theme", "mono", "-idle", "25ms"}, r, &out, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-theme", "mono", "-idle", "25ms"}, r, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}
@@ -603,7 +611,7 @@ func TestRealMainIdleFlag(t *testing.T) {
 
 func TestRealMainIdleNegative(t *testing.T) {
 	var errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-idle", "-1s"}, strings.NewReader(""), io.Discard, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-idle", "-1s"}, strings.NewReader(""), io.Discard, &errOut)
 	if code != 2 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}
@@ -828,7 +836,7 @@ func TestRealMainZeroMinutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-theme", "mono", "-idle", "0", "-dropfile", path}, strings.NewReader("hi\n"), &out, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-theme", "mono", "-idle", "0", "-dropfile", path}, strings.NewReader("hi\n"), &out, &errOut)
 	if code != 0 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}
@@ -841,9 +849,153 @@ func TestRealMainZeroMinutes(t *testing.T) {
 	}
 }
 
+func TestEOFAtPrompt(t *testing.T) {
+	r, w := io.Pipe()
+	w.Close()
+	var out bytes.Buffer
+	err := run(context.Background(), r, &out, io.Discard, session{
+		theme: theme.Mono,
+		width: 80,
+		idle:  time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if strings.Contains(text, "Goodbye") || strings.Contains(text, "Idle too long") || strings.Contains(text, "Returning to the BBS") {
+		t.Fatalf("printed a farewell to a caller who was gone: %q", text)
+	}
+}
+
+func TestEOFDuringStreamCancels(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer srv.Close()
+
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+	r, w := io.Pipe()
+	go func() {
+		io.WriteString(w, "hello\n")
+		<-started
+		w.Close()
+	}()
+
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), r, &out, &errOut, session{
+		client: client,
+		model:  "m",
+		theme:  theme.Mono,
+		width:  80,
+		idle:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("run: %v stderr %q", err, errOut.String())
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not see the request context canceled")
+	}
+	text := out.String()
+	if strings.Contains(text, "Goodbye") || strings.Contains(text, "not answering") || strings.Contains(text, "Returning to the BBS") {
+		t.Fatalf("out %q stderr %q", text, errOut.String())
+	}
+}
+
+func TestWriteErrorDuringStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"pong\"},\"done\":true}\n")
+	}))
+	defer srv.Close()
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+
+	r, w := io.Pipe()
+	defer w.Close()
+	go func() {
+		io.WriteString(w, "hello\n")
+	}()
+
+	out := &epipeWriter{}
+	var errOut bytes.Buffer
+	err := run(context.Background(), r, out, &errOut, session{
+		client: client,
+		model:  "m",
+		theme:  theme.Mono,
+		width:  80,
+		idle:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("run: %v stderr %q out %q", err, errOut.String(), out.String())
+	}
+	if strings.Contains(errOut.String(), "ollama chat") || strings.Contains(out.String(), "not answering") || strings.Contains(out.String(), "Goodbye") {
+		t.Fatalf("noisy hangup stderr %q out %q", errOut.String(), out.String())
+	}
+}
+
+func TestSIGHUPAtPrompt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r, w := io.Pipe()
+	defer w.Close()
+	var got lockedBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, r, &got, io.Discard, session{
+			theme: theme.Mono,
+			width: 80,
+			idle:  time.Hour,
+		})
+	}()
+	waitFor(t, got.String, "> ")
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
+	}
+	text := got.String()
+	if strings.Contains(text, "Goodbye") || strings.Contains(text, "Idle too long") || strings.Contains(text, "Returning to the BBS") {
+		t.Fatalf("printed a farewell after SIGHUP: %q", text)
+	}
+}
+
+// epipeWriter accepts the banner, then fails the reply with EPIPE.
+type epipeWriter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (e *epipeWriter) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if bytes.Contains(p, []byte("pong")) {
+		return 0, syscall.EPIPE
+	}
+	return e.buf.Write(p)
+}
+
+func (e *epipeWriter) String() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.buf.String()
+}
+
 func TestRealMainMaxMinNegative(t *testing.T) {
 	var errOut bytes.Buffer
-	code := realMain([]string{"-model", "m", "-maxmin", "-1"}, strings.NewReader(""), io.Discard, &errOut)
+	code := realMain(context.Background(), []string{"-model", "m", "-maxmin", "-1"}, strings.NewReader(""), io.Discard, &errOut)
 	if code != 2 {
 		t.Fatalf("code %d, stderr %q", code, errOut.String())
 	}

@@ -16,7 +16,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/e14tech/ollama-door/internal/ascii"
@@ -35,6 +38,11 @@ const historyLimit = 20
 
 // errTimeUp ends the call because the drop file's minutes ran out.
 var errTimeUp = errors.New("time is up")
+
+// errHangup means the carrier is gone: stdin closed, a read failed,
+// stdout broke, or the process was signaled. The caller is not there
+// to read a goodbye, so run turns this into a quiet status 0.
+var errHangup = errors.New("caller hung up")
 
 // session is one caller's visit.
 type session struct {
@@ -55,10 +63,15 @@ type session struct {
 }
 
 func main() {
-	os.Exit(realMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	// Interrupt, SIGTERM, and SIGHUP all mean the carrier or the BBS
+	// is going away. NotifyContext cancels ctx when one of them arrives.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	code := realMain(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
-func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
+func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("ollama-door", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	fs.Usage = func() {
@@ -146,7 +159,7 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 		deadline: sessionDeadline(minutes, limited),
 		idle:     *idle,
 	}
-	if err := run(context.Background(), in, out, errOut, s); err != nil {
+	if err := run(ctx, in, out, errOut, s); err != nil {
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
 		return 1
 	}
@@ -261,24 +274,28 @@ func sessionWarns(minutes int) (five, one time.Duration, fiveOn, oneOn bool) {
 }
 
 func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) error {
+	// hangCtx is the carrier. It is canceled by SIGHUP, SIGINT, SIGTERM
+	// (the parent ctx), by stdin closing, or by the first stdout error.
+	// Chat uses this context, so a hangup aborts the HTTP request.
+	// The session clock is separate: it does not cancel hangCtx, and
+	// canceling hangCtx does not look like the minutes ran out.
+	hangCtx, hangCancel := context.WithCancel(ctx)
+	defer hangCancel()
+	ew := newErrWriter(out, hangCancel)
+	out = ew
+
 	if _, err := io.WriteString(out, s.theme.Start); err != nil {
-		return err
+		return nil
 	}
 	defer io.WriteString(out, s.theme.End)
 
 	if err := writeBanner(out, s.alias, s.minutes, s.width); err != nil {
-		return err
+		return nil
 	}
-	// sessCtx ends when the drop-file clock runs out. Chat does not use
-	// it, so a reply that is already streaming is allowed to finish.
-	// The select below is what notices the deadline, and only while the
-	// prompt is waiting.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	sessCtx, sessCancel := sessionContext(ctx, s.deadline)
+	sessCtx, sessCancel := sessionContext(context.WithoutCancel(ctx), s.deadline)
 	defer sessCancel()
 	if sessionOver(sessCtx) {
-		return writeTimeUp(out, false)
+		return hangOrErr(writeTimeUp(out, false))
 	}
 
 	var history []ollama.Message
@@ -286,17 +303,16 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 		history = append(history, ollama.Message{Role: ollama.RoleSystem, Content: s.system})
 	}
 
-	// Cancel tells the reader goroutine to stop sending when this call ends.
-	// Scanner itself stays blocked until the next byte, which is fine:
-	// the process is about to exit, and tests close the pipe.
-	lines := readLines(ctx, in)
+	// readLines cancels hangCtx when stdin ends, so a reply that is
+	// streaming stops even though this loop is inside takeTurn.
+	lines := readLines(hangCtx, hangCancel, in)
 
 	prompt := func() error {
 		_, err := io.WriteString(out, "> ")
 		return err
 	}
 	if err := prompt(); err != nil {
-		return err
+		return nil
 	}
 	// Idle timers are replaced after every line. Session warnings are
 	// armed once, from the start of the call, and stay in this select.
@@ -306,100 +322,122 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 
 	for {
 		select {
-		case <-sessCtx.Done():
-			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
-			}
-			return sessCtx.Err()
+		case <-hangCtx.Done():
+			// The caller is gone. Do not print a goodbye.
+			return nil
 
-		case ev, ok := <-lines:
-			if !ok {
+		case <-sessCtx.Done():
+			if hangCtx.Err() != nil {
 				return nil
 			}
-			if ev.err != nil {
-				return ev.err
+			if sessionOver(sessCtx) {
+				return hangOrErr(writeTimeUp(out, true))
+			}
+			return nil
+
+		case ev, ok := <-lines:
+			// A line that already arrived was typed before the carrier
+			// dropped. Honor it. EOF and read errors are the hangup.
+			if !ok || ev.err != nil {
+				return nil
 			}
 			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
+				return hangOrErr(writeTimeUp(out, true))
 			}
 			line := strings.TrimSpace(ev.text)
 			if line == "" {
 				if err := prompt(); err != nil {
-					return err
+					return nil
 				}
 				stop, warn = s.armIdle()
 				continue
 			}
 			if isQuit(line) {
 				_, err := io.WriteString(out, "Goodbye.\r\n")
-				return err
+				return hangOrErr(err)
 			}
 			line = strings.TrimSpace(ascii.Sanitize(line))
 			if line == "" {
 				if err := prompt(); err != nil {
-					return err
+					return nil
 				}
 				stop, warn = s.armIdle()
 				continue
 			}
 			var err error
-			history, err = s.takeTurn(ctx, out, errOut, history, line)
-			// A reply in progress is not cut off. When it returns, the
-			// session clock may already have run out.
+			history, err = s.takeTurn(hangCtx, out, errOut, history, line)
+			// Hangup cancels the request. The session clock does not.
+			if errors.Is(err, errHangup) || hangCtx.Err() != nil {
+				return nil
+			}
+			// A reply in progress is not cut off by the session clock.
+			// When it returns, the minutes may already have run out.
 			if errors.Is(err, errTimeUp) || sessionOver(sessCtx) {
-				return writeTimeUp(out, false)
+				return hangOrErr(writeTimeUp(out, false))
 			}
 			if err != nil {
 				return err
 			}
 			if err := prompt(); err != nil {
-				return err
+				return nil
 			}
 			stop, warn = s.armIdle()
 
 		case <-left1:
 			left1 = nil
+			if hangCtx.Err() != nil {
+				return nil
+			}
 			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
+				return hangOrErr(writeTimeUp(out, true))
 			}
 			if err := writeNotice(out, "1 minute left."); err != nil {
-				return err
+				return nil
 			}
 			if err := prompt(); err != nil {
-				return err
+				return nil
 			}
 
 		case <-left5:
 			left5 = nil
+			if hangCtx.Err() != nil {
+				return nil
+			}
 			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
+				return hangOrErr(writeTimeUp(out, true))
 			}
 			if err := writeNotice(out, "5 minutes left."); err != nil {
-				return err
+				return nil
 			}
 			if err := prompt(); err != nil {
-				return err
+				return nil
 			}
 
 		case <-warn:
 			// One idle warning per wait. The stop timer keeps running.
 			warn = nil
+			if hangCtx.Err() != nil {
+				return nil
+			}
 			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
+				return hangOrErr(writeTimeUp(out, true))
 			}
 			if err := writeNotice(out, "Still there? One minute left."); err != nil {
-				return err
+				return nil
 			}
 			if err := prompt(); err != nil {
-				return err
+				return nil
 			}
 
 		case <-stop:
+			if hangCtx.Err() != nil {
+				return nil
+			}
 			if sessionOver(sessCtx) {
-				return writeTimeUp(out, true)
+				return hangOrErr(writeTimeUp(out, true))
 			}
 			_, err := io.WriteString(out, "\r\nIdle too long. Goodbye!\r\n")
-			return err
+			return hangOrErr(err)
 		}
 	}
 }
@@ -423,20 +461,33 @@ func writeNotice(out io.Writer, text string) error {
 }
 
 // lineEvent is one read from the caller.
-// A closed channel means stdin reached EOF, which is how the BBS hangs up.
 type lineEvent struct {
 	text string
 	err  error
 }
 
-// readLines scans r on its own goroutine.
-// Scan blocks, so the door cannot select on it directly. The goroutine
-// turns each line into a send, and run selects on that channel versus
-// the idle timer.
-func readLines(ctx context.Context, r io.Reader) <-chan lineEvent {
+// readLines scans r on its own goroutine. Scan blocks, so the prompt
+// loop cannot select on it directly. Each finished line is sent on the
+// returned channel.
+//
+// The goroutine exits in one of three ways:
+//
+//  1. Scan returns. That is EOF or a read error. defer cancel() runs
+//     first, which aborts a streaming reply, and then the channel is
+//     closed. A read error is sent if the prompt loop is still receiving.
+//  2. It is blocked sending a line and ctx is canceled. The select takes
+//     ctx.Done() and returns, so shutdown does not wait on that send.
+//  3. Scan is blocked inside Read. A context cannot interrupt that call.
+//     Closing stdin unblocks it. The BBS does that when the carrier drops.
+//     Exiting the process does too.
+//
+// cancel may run more than once. run also cancels on the way out, which
+// wakes a goroutine stuck on the send in case 2.
+func readLines(ctx context.Context, cancel context.CancelFunc, r io.Reader) <-chan lineEvent {
 	ch := make(chan lineEvent)
 	go func() {
 		defer close(ch)
+		defer cancel()
 		sc := bufio.NewScanner(r)
 		for sc.Scan() {
 			ev := lineEvent{text: sc.Text()}
@@ -447,13 +498,74 @@ func readLines(ctx context.Context, r io.Reader) <-chan lineEvent {
 			}
 		}
 		if err := sc.Err(); err != nil {
+			// Cancel before the send. takeTurn may be blocked in Chat
+			// and will not be reading this channel.
+			cancel()
 			select {
 			case <-ctx.Done():
-			case ch <- lineEvent{err: fmt.Errorf("read stdin: %w", err)}:
+			case ch <- lineEvent{err: err}:
 			}
 		}
 	}()
 	return ch
+}
+
+// hangOrErr turns a carrier failure into a nil error so the process
+// exits 0. Any other error is returned as-is.
+func hangOrErr(err error) error {
+	if err == nil || errors.Is(err, errHangup) || errors.Is(err, context.Canceled) || isCarrier(err) {
+		return nil
+	}
+	return err
+}
+
+func isCarrier(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EIO) || errors.Is(err, os.ErrClosed)
+}
+
+// errWriter remembers the first Write error and keeps returning it.
+// A broken stdout is a hangup, so stop runs once and cancels the chat.
+type errWriter struct {
+	w    io.Writer
+	stop func()
+
+	mu  sync.Mutex
+	err error
+}
+
+func newErrWriter(w io.Writer, stop func()) *errWriter {
+	return &errWriter{w: w, stop: stop}
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	if e.err != nil {
+		err := e.err
+		e.mu.Unlock()
+		return 0, err
+	}
+	n, err := e.w.Write(p)
+	failed := err != nil && e.err == nil
+	if failed {
+		e.err = err
+	}
+	stop := e.stop
+	e.mu.Unlock()
+	if failed && stop != nil {
+		stop()
+	}
+	return n, err
+}
+
+func (e *errWriter) Err() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
+}
+
+func writerFailed(w io.Writer) bool {
+	ew, ok := w.(*errWriter)
+	return ok && ew.Err() != nil
 }
 
 // idleWaits is how long to wait for a line, and when to warn.
@@ -547,8 +659,9 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	history = append(history, ollama.Message{Role: ollama.RoleUser, Content: line})
 	history = trimHistory(history)
 
-	// ctx is canceled when the call returns, not when the session clock
-	// runs out. The reply in progress is allowed to finish.
+	// ctx here is the hangup context. Canceling it aborts this request.
+	// The session deadline is a different context and is not passed in,
+	// so the minutes running out does not cancel the reply.
 	lw := wrap.NewLineWriter(out, s.width)
 	var spoken strings.Builder
 	_, err := s.client.Chat(ctx, ollama.ChatRequest{
@@ -562,6 +675,9 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 		return lw.WriteString(text)
 	})
 	flushErr := lw.Flush()
+	if writerFailed(out) || errors.Is(err, context.Canceled) || isCarrier(err) {
+		return history, errHangup
+	}
 	if err != nil {
 		// The model did not finish, so this turn is forgotten.
 		history = history[:len(history)-1]
