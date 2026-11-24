@@ -59,6 +59,7 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-host` | `http://localhost:11434` | Ollama base URL |
 | `-width` | `80` | Optional column override. Classic terminals use 40 or 80 |
 | `-theme` | from the drop file, else `mono` | Optional override: `mono` or `green` |
+| `-idle` | `5m` | Hang up if the caller types nothing for this long. `0` turns it off |
 | `-system` | a short sysop prompt | First chat message. The default asks for short plain-ASCII answers |
 
 `-theme` and `-width` are for a local test and for a sysop who wants to
@@ -70,6 +71,15 @@ so on stderr.
 A positive minutes-left value in the drop file ends the call when that
 time is up. Zero, or a file that does not include the field, does not
 start a clock.
+
+`-idle` is a second clock, and it runs only while the `>` prompt is
+waiting for a line. A long Ollama reply does not count. The default is
+5 minutes. About a minute before the limit, when the limit is at least
+2 minutes, the door prints `Still there? One minute left.` When the
+limit is reached it prints `Idle too long. Goodbye!` and exits.
+`-idle 0` turns that off. `-idle 30s` is useful while you are testing.
+Synchronet also has Maximum Inactivity, which hangs up the socket from
+the BBS side. `-idle` is the door's own wait.
 
 The screen stays plain. There is no box and no border. `green` clears
 the display, homes the cursor, and leaves the `>` prompt on a black
@@ -298,14 +308,12 @@ Docs:
 
 ## Your next steps
 
-The chat loop, sanitizer, wrapper, Ollama client, themes, and drop file
-reader are in place. A few small exercises are left:
+The chat loop, sanitizer, wrapper, Ollama client, themes, drop file
+reader, and idle hangup are in place. A few small exercises are left:
 
-1. **Idle timeout.** If the caller types nothing for a few minutes, say
-   goodbye and exit. `bufio.Scanner` does not have a timeout. Read stdin
-   with a deadline, or start a timer that cancels the context you pass
-   to `Chat`. Synchronet's Maximum Inactivity is the BBS-side version of
-   the same idea.
+1. **Warning lead time.** `idleWaits` warns one minute before the end,
+   and only when `-idle` is at least 2 minutes. Change it so a 90 second
+   limit warns 30 seconds ahead, and add a row to `TestIdleWaits`.
 2. **Node number.** `DOOR32.SYS` line 11 is the node. Read it in
    `internal/dropfile` and add `Node 1` to the greeting.
 3. **A strict zero.** `MinutesLeft == 0` currently means "no clock",

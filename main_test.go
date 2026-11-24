@@ -341,3 +341,249 @@ func TestRunTimeUpDuringChat(t *testing.T) {
 		t.Fatalf("time-up looked like an Ollama failure: %q", out.String())
 	}
 }
+
+func TestIdleWaits(t *testing.T) {
+	tests := []struct {
+		name   string
+		idle   time.Duration
+		stop   time.Duration
+		warn   time.Duration
+		warnOn bool
+	}{
+		{name: "off", idle: 0},
+		{name: "negative", idle: -time.Second},
+		{name: "short", idle: 30 * time.Second, stop: 30 * time.Second},
+		{name: "under two minutes", idle: 90 * time.Second, stop: 90 * time.Second},
+		{name: "two minutes", idle: 2 * time.Minute, stop: 2 * time.Minute, warn: time.Minute, warnOn: true},
+		{name: "default", idle: 5 * time.Minute, stop: 5 * time.Minute, warn: 4 * time.Minute, warnOn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stop, warn, warnOn := idleWaits(tt.idle)
+			if stop != tt.stop || warn != tt.warn || warnOn != tt.warnOn {
+				t.Fatalf("idleWaits(%s) = %s, %s, %v", tt.idle, stop, warn, warnOn)
+			}
+		})
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	themes := []theme.Theme{theme.Mono, theme.Green}
+	for _, th := range themes {
+		t.Run(th.Name, func(t *testing.T) {
+			r, w := io.Pipe()
+			defer w.Close()
+			var out bytes.Buffer
+			start := time.Now()
+			err := run(context.Background(), r, &out, io.Discard, session{
+				theme: th,
+				width: 80,
+				idle:  30 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if time.Since(start) > time.Second {
+				t.Fatalf("idle wait took %s", time.Since(start))
+			}
+			text := out.String()
+			if !strings.Contains(text, "\r\nIdle too long. Goodbye!\r\n") {
+				t.Fatalf("out %q", text)
+			}
+			if !strings.HasPrefix(text, th.Start) || !strings.HasSuffix(text, th.End) {
+				t.Fatalf("theme not wrapped around the hangup: %q", text)
+			}
+			wantEsc := strings.Count(th.Start, "\x1b") + strings.Count(th.End, "\x1b")
+			if got := strings.Count(text, "\x1b"); got != wantEsc {
+				t.Fatalf("escape count %d, want %d in %q", got, wantEsc, text)
+			}
+		})
+	}
+}
+
+func TestIdleDisabled(t *testing.T) {
+	var out bytes.Buffer
+	err := run(context.Background(), strings.NewReader("quit\n"), &out, io.Discard, session{
+		theme: theme.Mono,
+		width: 80,
+		idle:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "Idle too long") {
+		t.Fatalf("idle fired while disabled: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.\r\n") {
+		t.Fatalf("out %q", out.String())
+	}
+}
+
+func TestLineArrivesBeforeIdle(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	go func() {
+		io.WriteString(w, "quit\n")
+	}()
+	var out bytes.Buffer
+	err := run(context.Background(), r, &out, io.Discard, session{
+		theme: theme.Mono,
+		width: 80,
+		idle:  time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if strings.Contains(text, "Idle too long") || strings.Contains(text, "Still there") {
+		t.Fatalf("idle text on a typed quit: %q", text)
+	}
+	if !strings.Contains(text, "Goodbye.\r\n") {
+		t.Fatalf("out %q", text)
+	}
+}
+
+func TestIdleDoesNotFireDuringReply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"pong\"},\"done\":true}\n")
+	}))
+	defer srv.Close()
+
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+	r, w := io.Pipe()
+	defer w.Close()
+	// The write blocks until the reader starts, so the line is waiting
+	// before the idle timer is armed. The pipe stays open afterward,
+	// which is a caller who does not hang up.
+	go func() {
+		io.WriteString(w, "hello\n")
+	}()
+
+	var out bytes.Buffer
+	err := run(context.Background(), r, &out, io.Discard, session{
+		client: client,
+		model:  "m",
+		theme:  theme.Mono,
+		width:  80,
+		idle:   40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	pong := strings.Index(text, "pong\r\n")
+	idleAt := strings.Index(text, "Idle too long. Goodbye!")
+	if pong < 0 || idleAt < 0 || pong > idleAt {
+		t.Fatalf("out %q", text)
+	}
+}
+
+func TestIdleWarningThenHangup(t *testing.T) {
+	idle := 2 * time.Minute
+	warnCh := make(chan time.Time)
+	stopCh := make(chan time.Time)
+	r, w := io.Pipe()
+	defer w.Close()
+
+	var got lockedBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(context.Background(), r, &got, io.Discard, session{
+			theme: theme.Mono,
+			width: 80,
+			idle:  idle,
+			after: func(d time.Duration) <-chan time.Time {
+				switch d {
+				case idle:
+					return stopCh
+				case idle - time.Minute:
+					return warnCh
+				default:
+					return make(chan time.Time)
+				}
+			},
+		})
+	}()
+
+	waitFor(t, got.String, "> ")
+	warnCh <- time.Now()
+	waitFor(t, got.String, "\r\nStill there? One minute left.\r\n")
+	if strings.Contains(got.String(), "Idle too long") {
+		t.Fatalf("cutoff fired with the warning: %q", got.String())
+	}
+	stopCh <- time.Now()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
+	}
+	text := got.String()
+	if !strings.Contains(text, "\r\nIdle too long. Goodbye!\r\n") {
+		t.Fatalf("out %q", text)
+	}
+	if strings.Contains(text, "\x1b") {
+		t.Fatalf("idle text contained an escape: %q", text)
+	}
+}
+
+func TestRealMainIdleFlag(t *testing.T) {
+	r, w := io.Pipe()
+	defer w.Close()
+	var out, errOut bytes.Buffer
+	code := realMain([]string{"-model", "m", "-theme", "mono", "-idle", "25ms"}, r, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("code %d, stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Idle too long. Goodbye!\r\n") {
+		t.Fatalf("out %q", out.String())
+	}
+	if strings.Contains(out.String(), "\x1b") {
+		t.Fatal("mono idle hangup sent ANSI")
+	}
+}
+
+func TestRealMainIdleNegative(t *testing.T) {
+	var errOut bytes.Buffer
+	code := realMain([]string{"-model", "m", "-idle", "-1s"}, strings.NewReader(""), io.Discard, &errOut)
+	if code != 2 {
+		t.Fatalf("code %d, stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "-idle must be 0 or positive") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that run and the test can share.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func waitFor(t *testing.T, got func() string, sub string) {
+	t.Helper()
+	dead := time.Now().Add(2 * time.Second)
+	for time.Now().Before(dead) {
+		if strings.Contains(got(), sub) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q in %q", sub, got())
+}

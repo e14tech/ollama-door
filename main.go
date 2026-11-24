@@ -46,6 +46,12 @@ type session struct {
 	alias    string
 	minutes  int
 	deadline time.Time
+	// idle is how long to wait at the prompt with no line typed.
+	// Zero disables the idle hangup.
+	idle time.Duration
+	// after starts a timer. Nil means time.After. Tests pass a fake
+	// so they can fire the warning without waiting minutes.
+	after func(time.Duration) <-chan time.Time
 }
 
 func main() {
@@ -65,6 +71,7 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 	dropPath := fs.String("dropfile", "", "path to DOOR32.SYS or DOOR.SYS (how a BBS launches the door)")
 	width := fs.Int("width", 80, "optional column override for a local test; classic terminals use 40 or 80")
 	themeName := fs.String("theme", "mono", "optional theme override: mono or green (default: from the drop file)")
+	idle := fs.Duration("idle", 5*time.Minute, "hang up if the caller types nothing for this long; 0 disables")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -79,6 +86,11 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 	}
 	if *width < 1 {
 		fmt.Fprintf(errOut, "ollama-door: -width must be at least 1\r\n")
+		fs.Usage()
+		return 2
+	}
+	if *idle < 0 {
+		fmt.Fprintf(errOut, "ollama-door: -idle must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
@@ -109,8 +121,8 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
 	client := ollama.New(*host)
-	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s\r\n",
-		*model, client.BaseURL, *width, th.Name)
+	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s\r\n",
+		*model, client.BaseURL, *width, th.Name, *idle)
 	if dropOK {
 		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d ansi=%t\r\n",
 			alias, info.MinutesLeft, info.ANSI)
@@ -125,6 +137,7 @@ func realMain(args []string, in io.Reader, out, errOut io.Writer) int {
 		alias:    alias,
 		minutes:  info.MinutesLeft,
 		deadline: deadlineFromMinutes(info.MinutesLeft),
+		idle:     *idle,
 	}
 	if err := run(context.Background(), in, out, errOut, s); err != nil {
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
@@ -209,6 +222,13 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 		history = append(history, ollama.Message{Role: ollama.RoleSystem, Content: s.system})
 	}
 
+	// Cancel tells the reader goroutine to stop sending when this call ends.
+	// Scanner itself stays blocked until the next byte, which is fine:
+	// the process is about to exit, and tests close the pipe.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	lines := readLines(ctx, in)
+
 	prompt := func() error {
 		_, err := io.WriteString(out, "> ")
 		return err
@@ -216,48 +236,143 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	if err := prompt(); err != nil {
 		return err
 	}
+	// The idle timers start here, at the prompt, and are replaced after
+	// every line. They are not watched while takeTurn is streaming.
+	stop, warn := s.armIdle()
 
-	sc := bufio.NewScanner(in)
-	for sc.Scan() {
-		if pastDeadline(s.deadline) {
-			_, err := io.WriteString(out, "Your time is up. Goodbye.\r\n")
-			return err
-		}
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+	for {
+		select {
+		case ev, ok := <-lines:
+			if !ok {
+				return nil
+			}
+			if ev.err != nil {
+				return ev.err
+			}
+			if pastDeadline(s.deadline) {
+				_, err := io.WriteString(out, "Your time is up. Goodbye.\r\n")
+				return err
+			}
+			line := strings.TrimSpace(ev.text)
+			if line == "" {
+				if err := prompt(); err != nil {
+					return err
+				}
+				stop, warn = s.armIdle()
+				continue
+			}
+			if isQuit(line) {
+				_, err := io.WriteString(out, "Goodbye.\r\n")
+				return err
+			}
+			line = strings.TrimSpace(ascii.Sanitize(line))
+			if line == "" {
+				if err := prompt(); err != nil {
+					return err
+				}
+				stop, warn = s.armIdle()
+				continue
+			}
+			var err error
+			history, err = s.takeTurn(ctx, out, errOut, history, line)
+			if errors.Is(err, errTimeUp) {
+				_, werr := io.WriteString(out, "Your time is up. Goodbye.\r\n")
+				return werr
+			}
+			if err != nil {
+				return err
+			}
 			if err := prompt(); err != nil {
 				return err
 			}
-			continue
-		}
-		if isQuit(line) {
-			_, err := io.WriteString(out, "Goodbye.\r\n")
-			return err
-		}
-		line = strings.TrimSpace(ascii.Sanitize(line))
-		if line == "" {
+			stop, warn = s.armIdle()
+
+		case <-warn:
+			// One warning per wait. The stop timer keeps running.
+			// The prompt is still on its row, so the warning starts on the next one.
+			warn = nil
+			if _, err := io.WriteString(out, "\r\nStill there? One minute left.\r\n"); err != nil {
+				return err
+			}
 			if err := prompt(); err != nil {
 				return err
 			}
-			continue
-		}
-		var err error
-		history, err = s.takeTurn(ctx, out, errOut, history, line)
-		if errors.Is(err, errTimeUp) {
-			_, werr := io.WriteString(out, "Your time is up. Goodbye.\r\n")
-			return werr
-		}
-		if err != nil {
-			return err
-		}
-		if err := prompt(); err != nil {
+
+		case <-stop:
+			_, err := io.WriteString(out, "\r\nIdle too long. Goodbye!\r\n")
 			return err
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+}
+
+// lineEvent is one read from the caller.
+// A closed channel means stdin reached EOF, which is how the BBS hangs up.
+type lineEvent struct {
+	text string
+	err  error
+}
+
+// readLines scans r on its own goroutine.
+// Scan blocks, so the door cannot select on it directly. The goroutine
+// turns each line into a send, and run selects on that channel versus
+// the idle timer.
+func readLines(ctx context.Context, r io.Reader) <-chan lineEvent {
+	ch := make(chan lineEvent)
+	go func() {
+		defer close(ch)
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			ev := lineEvent{text: sc.Text()}
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- ev:
+			}
+		}
+		if err := sc.Err(); err != nil {
+			select {
+			case <-ctx.Done():
+			case ch <- lineEvent{err: fmt.Errorf("read stdin: %w", err)}:
+			}
+		}
+	}()
+	return ch
+}
+
+// idleWaits is how long to wait for a line, and when to warn.
+// A limit under two minutes has no warning, so the warning is not the
+// whole wait. Zero or negative means the idle hangup is off.
+func idleWaits(idle time.Duration) (stop, warn time.Duration, warnOn bool) {
+	if idle <= 0 {
+		return 0, 0, false
 	}
-	return nil
+	if idle >= 2*time.Minute {
+		return idle, idle - time.Minute, true
+	}
+	return idle, 0, false
+}
+
+// armIdle starts the timers for one wait at the prompt.
+// The channels from the previous wait are dropped, so a reply that ran
+// long does not use up the idle budget. time.After is enough here: a
+// door arms the timer once per line, not thousands of times a second.
+func (s session) armIdle() (stop, warn <-chan time.Time) {
+	stopFor, warnFor, warnOn := idleWaits(s.idle)
+	if stopFor <= 0 {
+		return nil, nil
+	}
+	stop = s.wakeAfter(stopFor)
+	if warnOn {
+		warn = s.wakeAfter(warnFor)
+	}
+	return stop, warn
+}
+
+func (s session) wakeAfter(d time.Duration) <-chan time.Time {
+	if s.after != nil {
+		return s.after(d)
+	}
+	return time.After(d)
 }
 
 func writeBanner(out io.Writer, alias string, minutes, width int) error {
