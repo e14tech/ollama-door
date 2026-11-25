@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,6 +273,10 @@ func TestRealMainChat(t *testing.T) {
 	var mu sync.Mutex
 	var got []ollama.ChatRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		var req ollama.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -337,7 +342,7 @@ func TestRealMainOllamaErrorContinues(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code %d", code)
 	}
-	if !strings.Contains(out.String(), "not answering") || !strings.Contains(out.String(), "Goodbye.\r\n") {
+	if !strings.Contains(out.String(), msgNoModel) || !strings.Contains(out.String(), "Goodbye.\r\n") {
 		t.Fatalf("out %q", out.String())
 	}
 	if !strings.Contains(errOut.String(), "404") {
@@ -991,6 +996,247 @@ func (e *epipeWriter) String() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.buf.String()
+}
+
+func TestFriendlyAI(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "unreachable", err: fmt.Errorf("dial: %w", ollama.ErrUnreachable), want: msgNapping},
+		{name: "model sentinel", err: ollama.ErrModelNotFound, want: msgNoModel},
+		{
+			name: "404 status",
+			err:  &ollama.StatusError{Code: 404, Status: "404 Not Found", Body: "model not found"},
+			want: msgNoModel,
+		},
+		{
+			name: "500 status",
+			err:  &ollama.StatusError{Code: 500, Status: "500 Internal Server Error", Body: "boom"},
+			want: msgGeneric,
+		},
+		{name: "bad stream", err: fmt.Errorf("decode: %w", ollama.ErrBadStream), want: msgGeneric},
+		{name: "stall", err: ollama.ErrStall, want: msgSlow},
+		{name: "deadline", err: context.DeadlineExceeded, want: msgSlow},
+		{name: "other", err: fmt.Errorf("boom"), want: msgGeneric},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := friendlyAI(tt.err); got != tt.want {
+				t.Fatalf("friendlyAI = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFriendlyErrorsAndHistory(t *testing.T) {
+	var mu sync.Mutex
+	var got []ollama.ChatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		n := len(got)
+		got = append(got, req)
+		mu.Unlock()
+		switch n {
+		case 0:
+			http.Error(w, "model not found", http.StatusNotFound)
+		default:
+			fmt.Fprintf(w, "{\"message\":{\"role\":\"assistant\",\"content\":%q},\"done\":true}\n", "ok")
+		}
+	}))
+	defer srv.Close()
+
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), strings.NewReader("one\ntwo\nquit\n"), &out, &errOut, session{
+		client: client,
+		model:  "missing",
+		system: "sys",
+		theme:  theme.Mono,
+		width:  80,
+		idle:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, msgNoModel+"\r\n") || !strings.Contains(text, "ok\r\n") {
+		t.Fatalf("out %q", text)
+	}
+	if strings.Contains(text, "\x1b") {
+		t.Fatal("friendly text contained an escape")
+	}
+	if !strings.Contains(errOut.String(), "404") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("requests %d", len(got))
+	}
+	for _, m := range got[1].Messages {
+		if m.Content == "one" {
+			t.Fatalf("failed user line was kept: %+v", got[1].Messages)
+		}
+	}
+	last := got[1].Messages[len(got[1].Messages)-1]
+	if last.Role != ollama.RoleUser || last.Content != "two" {
+		t.Fatalf("second request ended with %+v", last)
+	}
+}
+
+func TestFriendlyServerErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body func(http.ResponseWriter)
+		want string
+	}{
+		{
+			name: "500",
+			body: func(w http.ResponseWriter) {
+				http.Error(w, "boom", http.StatusInternalServerError)
+			},
+			want: msgGeneric,
+		},
+		{
+			name: "bad json",
+			body: func(w http.ResponseWriter) {
+				io.WriteString(w, "not-json\n")
+			},
+			want: msgGeneric,
+		},
+		{
+			name: "partial then bad json",
+			body: func(w http.ResponseWriter) {
+				io.WriteString(w, "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n")
+				io.WriteString(w, "not-json\n")
+			},
+			want: msgGeneric,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/chat" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				tt.body(w)
+			}))
+			defer srv.Close()
+			client := ollama.New(srv.URL)
+			client.HTTP = srv.Client()
+			var out, errOut bytes.Buffer
+			err := run(context.Background(), strings.NewReader("hi\nquit\n"), &out, &errOut, session{
+				client: client,
+				model:  "m",
+				theme:  theme.Green,
+				width:  80,
+				idle:   time.Hour,
+			})
+			if err != nil {
+				t.Fatalf("run: %v stderr %q", err, errOut.String())
+			}
+			text := out.String()
+			msgAt := strings.Index(text, tt.want+"\r\n")
+			if msgAt < 0 {
+				t.Fatalf("out %q stderr %q", text, errOut.String())
+			}
+			if strings.Contains(tt.name, "partial") {
+				hello := strings.Index(text, "Hello\r\n")
+				if hello < 0 || hello > msgAt {
+					t.Fatalf("partial line was not finished before the message: %q", text)
+				}
+			}
+			if !strings.HasPrefix(text, theme.Green.Start) || !strings.HasSuffix(text, theme.Green.End) {
+				t.Fatalf("theme missing: %q", text)
+			}
+			if !strings.Contains(text, "Goodbye.\r\n") {
+				t.Fatalf("did not return to the prompt: %q", text)
+			}
+		})
+	}
+}
+
+func TestStallTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Headers go out, then nothing. The client is waiting for a
+		// token. Canceling the request context should wake both sides.
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	client := ollama.New(srv.URL)
+	client.HTTP = srv.Client()
+	var out, errOut bytes.Buffer
+	start := time.Now()
+	err := run(context.Background(), strings.NewReader("hi\nquit\n"), &out, &errOut, session{
+		client:  client,
+		model:   "m",
+		theme:   theme.Mono,
+		width:   80,
+		idle:    time.Hour,
+		timeout: 80 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("stall took %s", time.Since(start))
+	}
+	if !strings.Contains(out.String(), msgSlow+"\r\n") || !strings.Contains(out.String(), "Goodbye.\r\n") {
+		t.Fatalf("out %q stderr %q", out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "ollama") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
+}
+
+func TestClosedListenerNapping(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-model", "m", "-host", "http://" + addr, "-theme", "mono", "-idle", "0"},
+		strings.NewReader("hi\nquit\n"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	text := out.String()
+	if strings.Count(text, msgNapping) < 1 {
+		t.Fatalf("out %q stderr %q", text, errOut.String())
+	}
+	if !strings.Contains(text, "Goodbye.\r\n") {
+		t.Fatalf("did not return to the prompt: %q", text)
+	}
+	if !strings.Contains(errOut.String(), "unreachable") && !strings.Contains(errOut.String(), "connection") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
 }
 
 func TestRealMainMaxMinNegative(t *testing.T) {
