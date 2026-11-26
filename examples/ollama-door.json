@@ -8,5 +8,7 @@
   "maxmin": 30,
   "log": "ollama-door-%n.log",
   "logchat": false,
-  "verbose": false
+  "verbose": false,
+  "echo": "auto",
+  "maxinput": 500
 }

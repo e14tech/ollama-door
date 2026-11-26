@@ -5,6 +5,7 @@
 - Session logs are quiet by default. Turn lines and other INFO records no longer go to the caller's stderr.
 - `-log` writes the log file. `-verbose` copies those lines to stderr for local debugging. `-logchat` applies only when one of those is on.
 - During a call, Ollama's raw error stays in that log. The caller still sees only the short friendly line. Startup failures (bad flags, a bad config file, a log file that will not open) still print on stderr before the screen starts.
+- The door echoes keystrokes and accepts Enter as CR, CRLF, LFCR, or CR NUL. A BBS does not do that for a Standard I/O door, so without it SyncTERM showed a cursor and ignored typing. `-echo auto` (the default) echoes when stdin is not a terminal. `-echo on` and `-echo off` force it. Backspace, DEL, and Ctrl-U edit the line. Ctrl-C or Ctrl-D on an empty line quits. `-maxinput` caps the line (default 500).
 
 ## 1.0.0
 

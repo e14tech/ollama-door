@@ -67,6 +67,8 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-log` | none | Log file path. `%n` and `{node}` become the node number |
 | `-verbose` | off | Copy log lines to stderr for local debugging |
 | `-logchat` | off | Also write the chat text. Used only with `-log` or `-verbose` |
+| `-echo` | `auto` | `auto` echoes when stdin is not a terminal. `on` always echoes. `off` never does |
+| `-maxinput` | `500` | Longest line the caller can type. Extra characters beep |
 | `-version` |  | Print the version and exit |
 
 `-theme` and `-width` are for a local test and for a sysop who wants to
@@ -105,7 +107,8 @@ that HTTP request is canceled. The session clock does not cancel it.
 The line reader is a goroutine. It exits when the read returns, or when
 it is waiting to hand off a line and the hangup context is canceled. A
 read blocked in the kernel ends when stdin is closed, which is what the
-BBS does when the carrier drops.
+BBS does when the carrier drops. EOF is a hangup. Ctrl-C or Ctrl-D on
+an empty line is a normal quit (`Goodbye.`).
 
 ## When the AI is not there
 
@@ -332,6 +335,18 @@ I/O Method `Standard` connects the caller's terminal to stdin and stdout.
 `Socket` is for a door that takes the TCP handle out of `DOOR32.SYS`
 line 2. This door does not. It reads and writes the standard streams.
 
+Synchronet does not echo keystrokes for that mode, and SyncTERM sends
+Enter as a carriage return (sometimes CR NUL or CRLF), not a lone LF.
+The door's line editor echoes printable ASCII and treats those Enter
+forms as one key. `-echo auto` turns that echo on when stdin is not a
+terminal, which is what Standard I/O gives the door (a socket, not a
+tty). A door started in your own terminal leaves echo to the terminal
+so letters are not doubled. Force it with `-echo on` or `-echo off`
+if a board uses a pty, or if you are debugging. Backspace and DEL erase
+one character, Ctrl-U clears the line, and Ctrl-C or Ctrl-D on an empty
+line quits. `-maxinput` (default 500) stops a huge paste; extra
+characters beep.
+
 Put `examples/ollama-door.json` next to the binary and edit the model
 name. The command line in the table is enough: `%f` is the drop file
 Synchronet just wrote. On Linux that name is often lowercase
@@ -354,7 +369,9 @@ A sample config:
   "maxmin": 30,
   "log": "ollama-door-%n.log",
   "logchat": false,
-  "verbose": false
+  "verbose": false,
+  "echo": "auto",
+  "maxinput": 500
 }
 ```
 

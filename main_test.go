@@ -1428,6 +1428,71 @@ func TestConfigFileSuppliesModel(t *testing.T) {
 	}
 }
 
+func TestRealMainEnterIsCR(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-model", "m", "-theme", "mono", "-idle", "0"},
+		strings.NewReader("quit\r"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "> quit\r\n") || !strings.Contains(text, "Goodbye.\r\n") {
+		t.Fatalf("out %q", text)
+	}
+}
+
+func TestRealMainEchoOff(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-model", "m", "-theme", "mono", "-idle", "0", "-echo", "off"},
+		strings.NewReader("quit\r"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	if strings.Contains(out.String(), "> quit") {
+		t.Fatalf("echoed while off: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.\r\n") {
+		t.Fatalf("out %q", out.String())
+	}
+}
+
+func TestResolveEcho(t *testing.T) {
+	if !resolveEcho("auto", strings.NewReader("")) {
+		t.Fatal("a pipe should echo in auto mode")
+	}
+	if resolveEcho("off", strings.NewReader("")) {
+		t.Fatal("off should not echo")
+	}
+	if !resolveEcho("on", strings.NewReader("")) {
+		t.Fatal("on should echo")
+	}
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if resolveEcho("auto", f) {
+		t.Fatal("a character device should not echo in auto mode")
+	}
+	if !resolveEcho("ON", f) {
+		t.Fatal("on should echo on a character device")
+	}
+}
+
+func TestRealMainBadEcho(t *testing.T) {
+	var errOut bytes.Buffer
+	code := realMain(context.Background(), []string{"-model", "m", "-echo", "tty"}, strings.NewReader(""), io.Discard, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "-echo must be auto, on, or off") {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+}
+
 func TestRealMainMaxMinNegative(t *testing.T) {
 	var errOut bytes.Buffer
 	code := realMain(context.Background(), []string{"-model", "m", "-maxmin", "-1"}, strings.NewReader(""), io.Discard, &errOut)

@@ -12,17 +12,19 @@ import (
 // A nil pointer means the key was left out, so the door keeps the
 // built-in default (or a flag) instead of treating 0 or "" as a choice.
 type File struct {
-	Host    *string `json:"host"`
-	Model   *string `json:"model"`
-	System  *string `json:"system"`
-	Theme   *string `json:"theme"`
-	Width   *int    `json:"width"`
-	Idle    *string `json:"idle"`
-	Timeout *string `json:"timeout"`
-	MaxMin  *int    `json:"maxmin"`
-	Log     *string `json:"log"`
-	LogChat *bool   `json:"logchat"`
-	Verbose *bool   `json:"verbose"`
+	Host     *string `json:"host"`
+	Model    *string `json:"model"`
+	System   *string `json:"system"`
+	Theme    *string `json:"theme"`
+	Width    *int    `json:"width"`
+	Idle     *string `json:"idle"`
+	Timeout  *string `json:"timeout"`
+	MaxMin   *int    `json:"maxmin"`
+	Log      *string `json:"log"`
+	LogChat  *bool   `json:"logchat"`
+	Verbose  *bool   `json:"verbose"`
+	Echo     *string `json:"echo"`
+	MaxInput *int    `json:"maxinput"`
 }
 
 // Load reads a JSON config file. Unknown keys are an error so a typo
