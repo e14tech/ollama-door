@@ -20,6 +20,7 @@ type options struct {
 	maxMin  int
 	logPath string
 	logChat bool
+	verbose bool
 }
 
 func defaultOptions() options {
@@ -46,6 +47,7 @@ type flagOptions struct {
 	maxMin  int
 	logPath string
 	logChat bool
+	verbose bool
 }
 
 // applyConfig copies keys that the file actually set.
@@ -91,6 +93,9 @@ func applyConfig(o options, file config.File) (options, bool, error) {
 	if file.LogChat != nil {
 		o.logChat = *file.LogChat
 	}
+	if file.Verbose != nil {
+		o.verbose = *file.Verbose
+	}
 	return o, themeSet, nil
 }
 
@@ -126,6 +131,9 @@ func applyFlags(o options, visited map[string]bool, f flagOptions) options {
 	}
 	if visited["logchat"] {
 		o.logChat = f.logChat
+	}
+	if visited["verbose"] {
+		o.verbose = f.verbose
 	}
 	return o
 }

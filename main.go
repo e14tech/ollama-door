@@ -36,8 +36,8 @@ const defaultSystem = "You are a helpful AI assistant on a retro BBS. You are no
 
 // version is printed by -version. Override it at build time:
 //
-//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.0" -o ollama-door .
-var version = "1.0.0"
+//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.1" -o ollama-door .
+var version = "1.0.1"
 
 // historyLimit is how many messages we send, counting the system message.
 // Older turns are dropped so a long call does not grow the request forever.
@@ -104,8 +104,9 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	timeout := fs.Duration("timeout", 60*time.Second, "cancel a reply that makes no progress for this long; 0 disables")
 	maxMin := fs.Int("maxmin", 0, "cap session minutes for a sysop; 0 uses the drop file only")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
-	logPath := fs.String("log", "", "log file path; empty logs to stderr only. %n and {node} become the node number")
-	logChat := fs.Bool("logchat", false, "log chat text; off by default")
+	logPath := fs.String("log", "", "log file path; empty means no log file. %n and {node} become the node number")
+	logChat := fs.Bool("logchat", false, "log chat text when -log or -verbose is on")
+	verbose := fs.Bool("verbose", false, "send log lines to stderr for local debugging")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -142,7 +143,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	opt = applyFlags(opt, visited, flagOptions{
 		host: *host, model: *model, system: *system, theme: *themeName,
 		width: *width, idle: *idle, timeout: *timeout, maxMin: *maxMin,
-		logPath: *logPath, logChat: *logChat,
+		logPath: *logPath, logChat: *logChat, verbose: *verbose,
 	})
 
 	if opt.model == "" {
@@ -180,7 +181,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		}
 	}
 
-	info, dropOK := loadDropfile(*dropPath, errOut)
+	info, _ := loadDropfile(*dropPath, errOut)
 	th, err := pickTheme(visited["theme"] || themeFromConfig, opt.theme, info.ANSI)
 	if err != nil {
 		fmt.Fprintf(errOut, "ollama-door: -theme must be mono or green\r\n")
@@ -191,17 +192,10 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
 	client := ollama.New(opt.host)
 	minutes, limited := applyMaxMin(info, opt.maxMin)
-	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s timeout=%s maxmin=%d\r\n",
-		opt.model, client.BaseURL, opt.width, th.Name, opt.idle, opt.timeout, opt.maxMin)
-	if dropOK || limited {
-		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t node=%d\r\n",
-			alias, minutes, limited, info.ANSI, info.Node)
-	}
-
-	lg, err := openLog(expandLogPath(opt.logPath, info.Node), info.Node, alias, opt.logChat, errOut)
+	lg, err := openLog(expandLogPath(opt.logPath, info.Node), info.Node, alias, opt.logChat, opt.verbose, errOut)
 	if err != nil {
 		fmt.Fprintf(errOut, "ollama-door: log: %v\r\n", err)
-		lg, _ = openLog("", info.Node, alias, opt.logChat, errOut)
+		lg, _ = openLog("", info.Node, alias, opt.logChat, opt.verbose, errOut)
 	}
 	if lg != nil {
 		defer lg.close()
@@ -221,7 +215,11 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		log:      lg,
 	}
 	if err := client.Ping(ctx); errors.Is(err, ollama.ErrUnreachable) {
-		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		// The caller sees the napping line. The dial error stays in the
+		// log, which is quiet unless -log or -verbose is set.
+		if lg != nil {
+			lg.aiError(err)
+		}
 		s.down = true
 	}
 	if err := run(ctx, in, out, errOut, s); err != nil {
@@ -348,7 +346,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 		}
 	}()
 	if s.log != nil {
-		s.log.event("start", "model", s.model, "theme", s.theme.Name)
+		s.log.event("start", "model", s.model, "theme", s.theme.Name, "width", s.width)
 	}
 	timeUp := func(atPrompt bool) error {
 		reason = "timeup"
@@ -818,7 +816,8 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	elapsed := time.Since(started)
 	if err != nil {
 		history = history[:len(history)-1]
-		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		// The caller already sees friendlyAI. The raw error stays in the
+		// log, which is discarded unless -log or -verbose is on.
 		if s.log != nil {
 			s.log.aiError(err)
 			s.log.turn(elapsed, len(line), spoken.Len(), line, spoken.String())

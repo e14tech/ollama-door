@@ -22,6 +22,7 @@ type File struct {
 	MaxMin  *int    `json:"maxmin"`
 	Log     *string `json:"log"`
 	LogChat *bool   `json:"logchat"`
+	Verbose *bool   `json:"verbose"`
 }
 
 // Load reads a JSON config file. Unknown keys are an error so a typo

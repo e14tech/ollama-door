@@ -7,5 +7,6 @@
   "timeout": "60s",
   "maxmin": 30,
   "log": "ollama-door-%n.log",
-  "logchat": false
+  "logchat": false,
+  "verbose": false
 }

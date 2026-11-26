@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 (unreleased)
+
+- Session logs are quiet by default. Turn lines and other INFO records no longer go to the caller's stderr.
+- `-log` writes the log file. `-verbose` copies those lines to stderr for local debugging. `-logchat` applies only when one of those is on.
+- During a call, Ollama's raw error stays in that log. The caller still sees only the short friendly line. Startup failures (bad flags, a bad config file, a log file that will not open) still print on stderr before the screen starts.
+
 ## 1.0.0
 
 First release of ollama-door, a BBS door that chats with a local Ollama server.

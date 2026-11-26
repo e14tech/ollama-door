@@ -1,5 +1,5 @@
 # Build a static ollama-door. VERSION is baked in with -ldflags.
-VERSION ?= 1.0.0
+VERSION ?= 1.0.1
 
 .PHONY: build test fmt
 

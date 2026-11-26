@@ -64,8 +64,9 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-maxmin` | `0` | Cap the session minutes. `0` uses the drop file only |
 | `-system` | built-in assistant prompt | First chat message. The default says the model is not the sysop and not a person |
 | `-config` | none | Optional JSON file. Explicit flags override it |
-| `-log` | stderr only | Log file path. `%n` and `{node}` become the node number |
-| `-logchat` | off | Also write the chat text into the log |
+| `-log` | none | Log file path. `%n` and `{node}` become the node number |
+| `-verbose` | off | Copy log lines to stderr for local debugging |
+| `-logchat` | off | Also write the chat text. Used only with `-log` or `-verbose` |
 | `-version` |  | Print the version and exit |
 
 `-theme` and `-width` are for a local test and for a sysop who wants to
@@ -109,8 +110,9 @@ BBS does when the carrier drops.
 ## When the AI is not there
 
 A failed turn does not end the call. The caller sees one plain line and
-the `>` prompt comes back. The Go error is written to stderr for the
-sysop.
+the `>` prompt comes back. The Go error is kept for the sysop log
+(`-log`, or `-verbose` while you are debugging). It is not printed on
+the caller's screen.
 
 | What happened | What the caller sees |
 | --- | --- |
@@ -230,7 +232,7 @@ standard library, so the result is a static binary you can copy onto a
 BBS host that does not have Go or a matching C library:
 
 ```sh
-CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.0" -o ollama-door .
+CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.1" -o ollama-door .
 ```
 
 `make build` runs that command. `main.version` is what `-version` prints.
@@ -298,8 +300,8 @@ printf 'quit\n' | go run . -model llama3.2 -dropfile examples/door32.sys -theme 
 You should see `0d 0a` (CR LF) at the ends of lines, and no `1b` bytes.
 
 If Ollama is not running, the door prints a short apology and the `>`
-prompt comes back. The details are on stderr. Stderr is for you, not
-for the caller's screen.
+prompt comes back. The dial error is written only when `-log` or
+`-verbose` is on.
 
 Running with no `-dropfile` still works (`mono`, 80 columns). Stderr
 notes that a BBS is expected to pass one.
@@ -351,7 +353,8 @@ A sample config:
   "timeout": "60s",
   "maxmin": 30,
   "log": "ollama-door-%n.log",
-  "logchat": false
+  "logchat": false,
+  "verbose": false
 }
 ```
 
@@ -360,12 +363,19 @@ command line replaces the file. `-theme` on the command line also
 replaces the drop file's ANSI choice. A theme that appears only in the
 config file does that too.
 
-The log is `log/slog` text. Each line has a timestamp, the node, the
-alias, and an event: `start`, `end` with a reason (`quit`, `idle`,
-`timeup`, or `hangup`), `ollama_error`, or `turn` (how long the reply
-took, and how many characters moved). The words of the chat stay out
-of the file unless `logchat` is true. `%n` and `{node}` in the path
-become the node number from `DOOR32.SYS` line 11 or `DOOR.SYS` line 4.
+With no `-log` and no `-verbose`, the door writes no log lines. The
+caller sees the screen only. `-log` is the file. `-verbose` copies the
+same lines to stderr when you are trying the door in a local terminal.
+Each line is `log/slog` text: a timestamp, the node, the alias, and an
+event (`start`, `end` with reason `quit`, `idle`, `timeup`, or `hangup`,
+`ollama_error`, or `turn` with latency and character counts). The words
+of the chat stay out unless `logchat` is true, and that switch does
+nothing unless logging is on. `%n` and `{node}` in the path become the
+node number from `DOOR32.SYS` line 11 or `DOOR.SYS` line 4.
+
+A bad flag, a bad config file, or a log file that cannot be opened
+still prints on stderr before the screen starts. After the banner, a
+failed reply does not add a raw Go error under the caller's text.
 
 `%w` is the client's terminal width. Leave `-theme` off so the drop
 file picks `green` or `mono`.
