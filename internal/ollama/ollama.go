@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Client talks to one Ollama server.
@@ -70,7 +72,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, onChunk func(ChatRes
 	}
 	resp, err := httpc.Do(httpReq)
 	if err != nil {
-		return ChatResponse{}, fmt.Errorf("ollama chat: %w", err)
+		return ChatResponse{}, chatTransportErr(ctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -80,15 +82,64 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, onChunk func(ChatRes
 	if !req.Stream {
 		var one ChatResponse
 		if err := json.NewDecoder(resp.Body).Decode(&one); err != nil {
-			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w", err)
+			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w: %w", ErrBadStream, err)
 		}
 		return one, nil
 	}
-	return readStream(resp.Body, onChunk)
+	return readStream(ctx, resp.Body, onChunk)
+}
+
+// Ping asks GET /api/version. A network failure is ErrUnreachable.
+// Any HTTP response means the server is up, even if the path is odd.
+func (c *Client) Ping(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("ollama ping: nil client")
+	}
+	if ctx == nil {
+		return fmt.Errorf("ollama ping: nil context")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/version", nil)
+	if err != nil {
+		return fmt.Errorf("ollama ping: %w: %w", ErrUnreachable, err)
+	}
+	httpc := c.HTTP
+	if httpc == nil {
+		httpc = http.DefaultClient
+	}
+	resp, err := httpc.Do(req)
+	if err != nil {
+		if ctx.Err() != nil && errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			return fmt.Errorf("ollama ping: %w: %w", ErrUnreachable, err)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("ollama ping: %w", ctx.Err())
+		}
+		return fmt.Errorf("ollama ping: %w: %w", ErrUnreachable, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	return nil
+}
+
+// chatTransportErr classifies a failed Do or read.
+// Context causes such as ErrStall win over the transport's wrapper.
+// Anything else that stopped the dial is ErrUnreachable.
+func chatTransportErr(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+			return fmt.Errorf("ollama chat: %w", cause)
+		}
+		return fmt.Errorf("ollama chat: %w", ctx.Err())
+	}
+	return fmt.Errorf("ollama chat: %w: %w", ErrUnreachable, err)
 }
 
 // readStream reads NDJSON. One JSON object per line.
-func readStream(body io.Reader, onChunk func(ChatResponse) error) (ChatResponse, error) {
+func readStream(ctx context.Context, body io.Reader, onChunk func(ChatResponse) error) (ChatResponse, error) {
 	sc := bufio.NewScanner(body)
 	// Scanner stops at 64KiB by default. A single token line can be longer.
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -103,7 +154,7 @@ func readStream(body io.Reader, onChunk func(ChatResponse) error) (ChatResponse,
 		}
 		var chunk ChatResponse
 		if err := json.Unmarshal(line, &chunk); err != nil {
-			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w", err)
+			return ChatResponse{}, fmt.Errorf("ollama chat: decode: %w: %w", ErrBadStream, err)
 		}
 		saw = true
 		full.WriteString(chunk.Message.Content)
@@ -115,10 +166,13 @@ func readStream(body io.Reader, onChunk func(ChatResponse) error) (ChatResponse,
 		last = chunk
 	}
 	if err := sc.Err(); err != nil {
-		return ChatResponse{}, fmt.Errorf("ollama chat: read: %w", err)
+		if ctx.Err() != nil {
+			return ChatResponse{}, chatTransportErr(ctx, err)
+		}
+		return ChatResponse{}, fmt.Errorf("ollama chat: read: %w: %w", ErrBadStream, err)
 	}
 	if !saw {
-		return ChatResponse{}, fmt.Errorf("ollama chat: empty response")
+		return ChatResponse{}, fmt.Errorf("ollama chat: %w", ErrBadStream)
 	}
 	last.Message.Content = full.String()
 	if last.Message.Role == "" {
@@ -129,12 +183,13 @@ func readStream(body io.Reader, onChunk func(ChatResponse) error) (ChatResponse,
 
 func statusError(resp *http.Response) error {
 	slurp, err := io.ReadAll(io.LimitReader(resp.Body, 512))
-	msg := strings.TrimSpace(string(slurp))
+	se := &StatusError{
+		Code:   resp.StatusCode,
+		Status: resp.Status,
+		Body:   strings.TrimSpace(string(slurp)),
+	}
 	if err != nil {
-		return fmt.Errorf("ollama chat: status %s: %w", resp.Status, err)
+		return fmt.Errorf("ollama chat: %w: %w", se, err)
 	}
-	if msg == "" {
-		return fmt.Errorf("ollama chat: status %s", resp.Status)
-	}
-	return fmt.Errorf("ollama chat: status %s: %s", resp.Status, msg)
+	return fmt.Errorf("ollama chat: %w", se)
 }

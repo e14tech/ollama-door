@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -114,6 +115,13 @@ func TestChatStatusError(t *testing.T) {
 	if !strings.Contains(err.Error(), "404") || !strings.Contains(err.Error(), "model not found") {
 		t.Fatalf("error = %v", err)
 	}
+	if !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("errors.Is model: %v", err)
+	}
+	var status *StatusError
+	if !errors.As(err, &status) || status.Code != http.StatusNotFound {
+		t.Fatalf("errors.As: %v", err)
+	}
 }
 
 func TestChatContextCancel(t *testing.T) {
@@ -188,5 +196,41 @@ func TestChatBadJSON(t *testing.T) {
 	_, err := c.Chat(context.Background(), ChatRequest{Model: "m", Stream: true}, nil)
 	if err == nil {
 		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrBadStream) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestChatUnreachable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	c := New("http://" + addr)
+	_, err = c.Chat(context.Background(), ChatRequest{Model: "m", Stream: true}, nil)
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestChatServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	_, err := c.Chat(context.Background(), ChatRequest{Model: "m", Stream: true}, nil)
+	var status *StatusError
+	if !errors.As(err, &status) || status.Code != http.StatusInternalServerError {
+		t.Fatalf("error = %v", err)
+	}
+	if errors.Is(err, ErrModelNotFound) {
+		t.Fatal("500 looked like a missing model")
 	}
 }

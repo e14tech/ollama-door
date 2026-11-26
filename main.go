@@ -57,6 +57,11 @@ type session struct {
 	// idle is how long to wait at the prompt with no line typed.
 	// Zero disables the idle hangup.
 	idle time.Duration
+	// timeout is how long a reply may sit with no new text.
+	// Zero disables that stall check.
+	timeout time.Duration
+	// down is set when the startup ping could not reach Ollama.
+	down bool
 	// after starts a timer. Nil means time.After. Tests pass a fake
 	// so they can fire the warning without waiting minutes.
 	after func(time.Duration) <-chan time.Time
@@ -85,6 +90,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	width := fs.Int("width", 80, "optional column override for a local test; classic terminals use 40 or 80")
 	themeName := fs.String("theme", "mono", "optional theme override: mono or green (default: from the drop file)")
 	idle := fs.Duration("idle", 5*time.Minute, "hang up if the caller types nothing for this long; 0 disables")
+	timeout := fs.Duration("timeout", 60*time.Second, "cancel a reply that makes no progress for this long; 0 disables")
 	maxMin := fs.Int("maxmin", 0, "cap session minutes for a sysop; 0 uses the drop file only")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
 	if err := fs.Parse(args); err != nil {
@@ -105,6 +111,11 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	}
 	if *idle < 0 {
 		fmt.Fprintf(errOut, "ollama-door: -idle must be 0 or positive\r\n")
+		fs.Usage()
+		return 2
+	}
+	if *timeout < 0 {
+		fmt.Fprintf(errOut, "ollama-door: -timeout must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
@@ -141,8 +152,8 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
 	client := ollama.New(*host)
 	minutes, limited := applyMaxMin(info, *maxMin)
-	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s maxmin=%d\r\n",
-		*model, client.BaseURL, *width, th.Name, *idle, *maxMin)
+	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s timeout=%s maxmin=%d\r\n",
+		*model, client.BaseURL, *width, th.Name, *idle, *timeout, *maxMin)
 	if dropOK || limited {
 		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t\r\n",
 			alias, minutes, limited, info.ANSI)
@@ -158,6 +169,11 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		minutes:  minutes,
 		deadline: sessionDeadline(minutes, limited),
 		idle:     *idle,
+		timeout:  *timeout,
+	}
+	if err := client.Ping(ctx); errors.Is(err, ollama.ErrUnreachable) {
+		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		s.down = true
 	}
 	if err := run(ctx, in, out, errOut, s); err != nil {
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
@@ -296,6 +312,12 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	defer sessCancel()
 	if sessionOver(sessCtx) {
 		return hangOrErr(writeTimeUp(out, false))
+	}
+	if s.down {
+		// The server was down at startup. Say so, then still offer the prompt.
+		if err := writeNotice(out, friendlyAI(ollama.ErrUnreachable)); err != nil {
+			return nil
+		}
 	}
 
 	var history []ollama.Message
@@ -649,6 +671,33 @@ func isQuit(line string) bool {
 	}
 }
 
+const (
+	msgNapping = "The AI is napping right now. Try again in a bit."
+	msgNoModel = "The AI model isn't installed. Please tell the sysop."
+	msgGeneric = "Something went wrong talking to the AI. Try again."
+	msgSlow    = "The AI is taking too long. Try again."
+)
+
+// friendlyAI maps an Ollama error to one short line for the caller.
+// errors.Is walks the %w chain. errors.As pulls out a *StatusError
+// when the chain holds one, which is how a 404 is recognized even if
+// a future wrapper forgets to unwrap ErrModelNotFound.
+func friendlyAI(err error) string {
+	var status *ollama.StatusError
+	switch {
+	case errors.Is(err, ollama.ErrUnreachable):
+		return msgNapping
+	case errors.Is(err, ollama.ErrModelNotFound):
+		return msgNoModel
+	case errors.As(err, &status) && status.Code == 404:
+		return msgNoModel
+	case errors.Is(err, ollama.ErrStall), errors.Is(err, context.DeadlineExceeded):
+		return msgSlow
+	default:
+		return msgGeneric
+	}
+}
+
 // takeTurn sends one caller line and writes the reply as it arrives.
 // Each chunk is sanitized, then wrapped. A finished line goes out as
 // soon as the next word does not fit. Flush writes whatever is left.
@@ -656,34 +705,52 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	if pastDeadline(s.deadline) {
 		return history, errTimeUp
 	}
+	// The user line is part of this request so the model can answer it.
+	// If the answer never arrives, we drop the line again. Otherwise the
+	// next turn would be two user messages in a row. A fragment that
+	// already reached the screen stays on the screen; it is not stored.
 	history = append(history, ollama.Message{Role: ollama.RoleUser, Content: line})
 	history = trimHistory(history)
 
-	// ctx here is the hangup context. Canceling it aborts this request.
-	// The session deadline is a different context and is not passed in,
-	// so the minutes running out does not cancel the reply.
+	// ctx is the hangup context. The session deadline is not a parent of
+	// reqCtx, so the minutes running out do not cancel this request.
+	// A stall timer is a child cancel with ErrStall as the cause.
+	reqCtx, stopReq := context.WithCancelCause(ctx)
+	defer stopReq(context.Canceled)
+	var stall *time.Timer
+	if s.timeout > 0 {
+		stall = time.AfterFunc(s.timeout, func() {
+			stopReq(ollama.ErrStall)
+		})
+		defer stall.Stop()
+	}
+
 	lw := wrap.NewLineWriter(out, s.width)
 	var spoken strings.Builder
-	_, err := s.client.Chat(ctx, ollama.ChatRequest{
+	_, err := s.client.Chat(reqCtx, ollama.ChatRequest{
 		Model:    s.model,
 		Messages: history,
 		Stream:   true,
 	}, func(chunk ollama.ChatResponse) error {
+		if stall != nil {
+			stall.Reset(s.timeout)
+		}
 		// Each chunk is a whole piece of text, so Sanitize can run on it alone.
 		text := ascii.Sanitize(chunk.Message.Content)
 		spoken.WriteString(text)
 		return lw.WriteString(text)
 	})
+	// End a half-written line before any apology, so the message
+	// starts on its own row.
 	flushErr := lw.Flush()
 	if writerFailed(out) || errors.Is(err, context.Canceled) || isCarrier(err) {
 		return history, errHangup
 	}
 	if err != nil {
-		// The model did not finish, so this turn is forgotten.
 		history = history[:len(history)-1]
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
-		if _, werr := io.WriteString(out, "Sorry, the sysop computer is not answering right now.\r\n"); werr != nil {
-			return history, werr
+		if _, werr := io.WriteString(out, friendlyAI(err)+"\r\n"); werr != nil {
+			return history, errHangup
 		}
 		return history, nil
 	}

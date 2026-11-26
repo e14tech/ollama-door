@@ -60,6 +60,7 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-width` | `80` | Optional column override. Classic terminals use 40 or 80 |
 | `-theme` | from the drop file, else `mono` | Optional override: `mono` or `green` |
 | `-idle` | `5m` | Hang up if the caller types nothing for this long. `0` turns it off |
+| `-timeout` | `60s` | Cancel a reply that sits with no new text for this long. `0` turns it off |
 | `-maxmin` | `0` | Cap the session minutes. `0` uses the drop file only |
 | `-system` | a short sysop prompt | First chat message. The default asks for short plain-ASCII answers |
 
@@ -100,6 +101,34 @@ The line reader is a goroutine. It exits when the read returns, or when
 it is waiting to hand off a line and the hangup context is canceled. A
 read blocked in the kernel ends when stdin is closed, which is what the
 BBS does when the carrier drops.
+
+## When the AI is not there
+
+A failed turn does not end the call. The caller sees one plain line and
+the `>` prompt comes back. The Go error is written to stderr for the
+sysop.
+
+| What happened | What the caller sees |
+| --- | --- |
+| Ollama cannot be reached | The AI is napping right now. Try again in a bit. |
+| The model is not installed (HTTP 404) | The AI model isn't installed. Please tell the sysop. |
+| Any other server or stream error | Something went wrong talking to the AI. Try again. |
+| No new text for `-timeout` | The AI is taking too long. Try again. |
+
+`-timeout` starts when the request starts and resets each time a piece
+of the reply arrives. A long answer that keeps producing text is left
+alone. `0` disables the stall check. The timer is a context wrapped
+around that one request. Hanging up and the session clock still use
+their own contexts.
+
+The user line is sent with the request, then removed again if no answer
+comes back. The next turn is not two user lines in a row. Text that
+already reached the screen stays there. A half-written line is finished
+with CRLF before the apology.
+
+Before the prompt, the door asks Ollama `GET /api/version`. If nothing
+is listening, the napping line is printed once and the prompt still
+appears.
 
 The screen stays plain. There is no box and no border. `green` clears
 the display, homes the cursor, and leaves the `>` prompt on a black
