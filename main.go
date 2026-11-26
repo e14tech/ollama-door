@@ -36,8 +36,8 @@ const defaultSystem = "You are a helpful AI assistant on a retro BBS. You are no
 
 // version is printed by -version. Override it at build time:
 //
-//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.1" -o ollama-door .
-var version = "1.0.1"
+//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.2" -o ollama-door .
+var version = "1.0.2"
 
 // historyLimit is how many messages we send, counting the system message.
 // Older turns are dropped so a long call does not grow the request forever.
@@ -371,7 +371,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	}
 	timeUp := func(atPrompt bool) error {
 		reason = "timeup"
-		return hangOrErr(writeTimeUp(out, atPrompt))
+		return hangOrErr(writeTimeUp(out, atPrompt, s.width))
 	}
 
 	// hangCtx is the carrier. It is canceled by SIGHUP, SIGINT, SIGTERM
@@ -399,7 +399,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	}
 	if s.down {
 		// The server was down at startup. Say so, then still offer the prompt.
-		if err := writeNotice(out, friendlyAI(ollama.ErrUnreachable)); err != nil {
+		if err := writeNotice(out, friendlyAI(ollama.ErrUnreachable), s.width); err != nil {
 			return nil
 		}
 	}
@@ -460,7 +460,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			}
 			if isQuit(line) {
 				reason = "quit"
-				_, err := io.WriteString(out, "Goodbye.\r\n")
+				_, err := io.WriteString(out, wrap.Wrap("Goodbye.", s.width))
 				return hangOrErr(err)
 			}
 			line = strings.TrimSpace(ascii.Sanitize(line))
@@ -499,7 +499,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			if sessionOver(sessCtx) {
 				return timeUp(true)
 			}
-			if err := writeNotice(out, "1 minute left."); err != nil {
+			if err := writeNotice(out, "1 minute left.", s.width); err != nil {
 				return nil
 			}
 			if err := prompt(); err != nil {
@@ -514,7 +514,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			if sessionOver(sessCtx) {
 				return timeUp(true)
 			}
-			if err := writeNotice(out, "5 minutes left."); err != nil {
+			if err := writeNotice(out, "5 minutes left.", s.width); err != nil {
 				return nil
 			}
 			if err := prompt(); err != nil {
@@ -530,7 +530,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			if sessionOver(sessCtx) {
 				return timeUp(true)
 			}
-			if err := writeNotice(out, "Still there? One minute left."); err != nil {
+			if err := writeNotice(out, "Still there? One minute left.", s.width); err != nil {
 				return nil
 			}
 			if err := prompt(); err != nil {
@@ -545,7 +545,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return timeUp(true)
 			}
 			reason = "idle"
-			_, err := io.WriteString(out, "\r\nIdle too long. Goodbye!\r\n")
+			_, err := io.WriteString(out, "\r\n"+wrap.Wrap("Idle too long. Goodbye!", s.width))
 			return hangOrErr(err)
 		}
 	}
@@ -553,8 +553,8 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 
 // writeTimeUp tells the caller the BBS clock has run out.
 // atPrompt is true when "> " is still sitting on the current row.
-func writeTimeUp(out io.Writer, atPrompt bool) error {
-	text := "Your time is up. Returning to the BBS...\r\n"
+func writeTimeUp(out io.Writer, atPrompt bool, width int) error {
+	text := wrap.Wrap("Your time is up. Returning to the BBS...", width)
 	if atPrompt {
 		text = "\r\n" + text
 	}
@@ -563,9 +563,10 @@ func writeTimeUp(out io.Writer, atPrompt bool) error {
 }
 
 // writeNotice prints one status line under the prompt and leaves the
-// cursor ready for prompt() to draw "> " again.
-func writeNotice(out io.Writer, text string) error {
-	_, err := io.WriteString(out, "\r\n"+text+"\r\n")
+// cursor ready for prompt() to draw "> " again. The text is wrapped so
+// it cannot fill the last column.
+func writeNotice(out io.Writer, text string, width int) error {
+	_, err := io.WriteString(out, "\r\n"+wrap.Wrap(text, width))
 	return err
 }
 
@@ -887,7 +888,7 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 			s.log.aiError(err)
 			s.log.turn(elapsed, len(line), spoken.Len(), line, spoken.String())
 		}
-		if _, werr := io.WriteString(out, friendlyAI(err)+"\r\n"); werr != nil {
+		if _, werr := io.WriteString(out, wrap.Wrap(friendlyAI(err), s.width)); werr != nil {
 			return history, errHangup
 		}
 		return history, nil
