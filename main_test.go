@@ -1463,13 +1463,13 @@ func TestRealMainEchoOff(t *testing.T) {
 }
 
 func TestResolveEcho(t *testing.T) {
-	if !resolveEcho("auto", strings.NewReader("")) {
+	if !resolveEcho("auto", strings.NewReader(""), false) {
 		t.Fatal("a pipe should echo in auto mode")
 	}
-	if resolveEcho("off", strings.NewReader("")) {
-		t.Fatal("off should not echo")
+	if resolveEcho("off", strings.NewReader(""), true) {
+		t.Fatal("off should not echo, even with a drop file")
 	}
-	if !resolveEcho("on", strings.NewReader("")) {
+	if !resolveEcho("on", strings.NewReader(""), false) {
 		t.Fatal("on should echo")
 	}
 	f, err := os.Open("/dev/null")
@@ -1477,10 +1477,13 @@ func TestResolveEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if resolveEcho("auto", f) {
-		t.Fatal("a character device should not echo in auto mode")
+	if resolveEcho("auto", f, false) {
+		t.Fatal("a character device should not echo in auto mode without a drop file")
 	}
-	if !resolveEcho("ON", f) {
+	if !resolveEcho("auto", f, true) {
+		t.Fatal("a drop file should echo even when stdin is a character device")
+	}
+	if !resolveEcho("ON", f, false) {
 		t.Fatal("on should echo on a character device")
 	}
 }

@@ -70,7 +70,7 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-log` | none | Log file path. `%n` and `{node}` become the node number |
 | `-verbose` | off | Copy log lines to stderr for local debugging |
 | `-logchat` | off | Also write the chat text. Used only with `-log` or `-verbose` |
-| `-echo` | `auto` | `auto` echoes when stdin is not a terminal. `on` always echoes. `off` never does |
+| `-echo` | `auto` | `auto` echoes when `-dropfile` is set. With no drop file, it echoes only when stdin is not a terminal. `on` and `off` force it |
 | `-maxinput` | `500` | Longest line the caller can type. Extra characters beep |
 | `-version` |  | Print the version and exit |
 
@@ -238,7 +238,7 @@ standard library, so the result is a static binary you can copy onto a
 BBS host that does not have Go or a matching C library:
 
 ```sh
-CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.2" -o ollama-door .
+CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.3" -o ollama-door .
 ```
 
 `make build` runs that command. `main.version` is what `-version` prints.
@@ -339,17 +339,22 @@ I/O Method `Standard` connects the caller's terminal to stdin and stdout.
 `Socket` is for a door that takes the TCP handle out of `DOOR32.SYS`
 line 2. This door does not. It reads and writes the standard streams.
 
-Synchronet does not echo keystrokes for that mode, and SyncTERM sends
-Enter as a carriage return (sometimes CR NUL or CRLF), not a lone LF.
-The door's line editor echoes printable ASCII and treats those Enter
-forms as one key. `-echo auto` turns that echo on when stdin is not a
-terminal, which is what Standard I/O gives the door (a socket, not a
-tty). A door started in your own terminal leaves echo to the terminal
-so letters are not doubled. Force it with `-echo on` or `-echo off`
-if a board uses a pty, or if you are debugging. Backspace and DEL erase
-one character, Ctrl-U clears the line, and Ctrl-C or Ctrl-D on an empty
-line quits. `-maxinput` (default 500) stops a huge paste; extra
-characters beep.
+Standard I/O is untranslated. Synchronet does not turn Enter into a
+line feed, and terminal echo is off: nothing else prints what the
+caller types. On Linux that stdin is often a pty, which is a character
+device, not a plain pipe. SyncTERM sends Enter as a carriage return
+(sometimes CR NUL or CRLF). The door's line editor echoes printable
+ASCII and treats those Enter forms as one key.
+
+`-echo auto` (the default) echoes whenever `-dropfile` is set, including
+on that pty. Without a drop file, auto echoes only when stdin is not a
+character device, so a local shell does not show each letter twice.
+`-echo on` and `-echo off` force it. A local test that passes
+`-dropfile` and runs in a real terminal will echo twice; use `-echo off`
+for that run. The door does not change the terminal's own mode.
+Backspace and DEL erase one character, Ctrl-U clears the line, and
+Ctrl-C or Ctrl-D on an empty line quits. `-maxinput` (default 500) stops
+a huge paste; extra characters beep.
 
 Put `examples/ollama-door.json` next to the binary and edit the model
 name. The command line in the table is enough: `%f` is the drop file

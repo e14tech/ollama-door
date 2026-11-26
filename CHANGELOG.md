@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3 (2026-11-26)
+
+- `-echo auto` echoes whenever `-dropfile` is set. Synchronet Standard I/O on Linux is untranslated and often a pty, so the old "not a terminal" check left echo off and the caller saw no typing. Without a drop file, auto still echoes only when stdin is not a character device.
+
 ## 1.0.2 (2026-11-26)
 
 - Wrapped rows stop one column short of the screen (79 on 80 columns, 39 on 40). A full row makes SyncTERM autowrap, and the door's CRLF was then adding a blank line. Replies, the banner, and status lines all use that limit.

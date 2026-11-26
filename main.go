@@ -36,8 +36,8 @@ const defaultSystem = "You are a helpful AI assistant on a retro BBS. You are no
 
 // version is printed by -version. Override it at build time:
 //
-//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.2" -o ollama-door .
-var version = "1.0.2"
+//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.3" -o ollama-door .
+var version = "1.0.3"
 
 // historyLimit is how many messages we send, counting the system message.
 // Older turns are dropped so a long call does not grow the request forever.
@@ -74,8 +74,9 @@ type session struct {
 	after func(time.Duration) <-chan time.Time
 	// log is the sysop log. Nil means do not log.
 	log *callLog
-	// echo copies keystrokes to the screen. A local terminal already
-	// does that, so auto mode leaves it off there.
+	// echo copies keystrokes to the screen. Auto mode is on when a
+	// drop file was given (a BBS). Without one, a local terminal
+	// already echoes, so auto leaves it off.
 	echo bool
 	// maxInput is the longest line the editor will keep.
 	maxInput int
@@ -112,7 +113,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	logPath := fs.String("log", "", "log file path; empty means no log file. %n and {node} become the node number")
 	logChat := fs.Bool("logchat", false, "log chat text when -log or -verbose is on")
 	verbose := fs.Bool("verbose", false, "send log lines to stderr for local debugging")
-	echoMode := fs.String("echo", "auto", "echo keystrokes: auto, on, or off")
+	echoMode := fs.String("echo", "auto", "echo keystrokes: auto (on with -dropfile), on, or off")
 	maxInput := fs.Int("maxinput", lineedit.DefaultMax, "max characters on one typed line")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -232,7 +233,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		idle:     opt.idle,
 		timeout:  opt.timeout,
 		log:      lg,
-		echo:     resolveEcho(opt.echo, in),
+		echo:     resolveEcho(opt.echo, in, strings.TrimSpace(*dropPath) != ""),
 		maxInput: opt.maxInput,
 	}
 	if err := client.Ping(ctx); errors.Is(err, ollama.ErrUnreachable) {
@@ -638,16 +639,21 @@ func validEcho(s string) bool {
 }
 
 // resolveEcho decides whether the door should echo keystrokes.
-// auto echoes when stdin is not a character device. Synchronet Standard
-// I/O hands the door a socket, so echo turns on. A shell session is a
-// terminal, and that terminal already echoes, so auto stays quiet.
-func resolveEcho(mode string, in io.Reader) bool {
+// auto is on whenever dropfile is set. Synchronet Standard I/O on Linux
+// is a pty, so a character-device check would leave the caller with no
+// echo. Without a drop file, auto echoes only when stdin is not a
+// character device. A local shell already echoes, and this stays out of
+// the terminal settings.
+func resolveEcho(mode string, in io.Reader, dropfile bool) bool {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "on":
 		return true
 	case "off":
 		return false
 	default:
+		if dropfile {
+			return true
+		}
 		return !isCharDevice(in)
 	}
 }
