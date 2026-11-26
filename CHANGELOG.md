@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1 (unreleased)
+## 1.0.1 (2026-11-26)
 
 - Session logs are quiet by default. Turn lines and other INFO records no longer go to the caller's stderr.
 - `-log` writes the log file. `-verbose` copies those lines to stderr for local debugging. `-logchat` applies only when one of those is on.
