@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2 (2026-11-26)
+
+- Wrapped rows stop one column short of the screen (79 on 80 columns, 39 on 40). A full row makes SyncTERM autowrap, and the door's CRLF was then adding a blank line. Replies, the banner, and status lines all use that limit.
+
 ## 1.0.1 (2026-11-26)
 
 - Session logs are quiet by default. Turn lines and other INFO records no longer go to the caller's stderr.

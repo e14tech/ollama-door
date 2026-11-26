@@ -7,16 +7,19 @@ import (
 	"strings"
 )
 
-// Wrap returns text broken into lines of at most width columns.
+// Wrap returns text broken into lines that fit a screen of width columns.
 //
-// Split on spaces. A word longer than width is cut into width-sized
-// pieces so it cannot run off the screen. A newline ends the current
-// line. Two newlines in a row leave a blank line, which keeps paragraphs
-// apart. Each output line, including the last, ends with CRLF ("\r\n").
-// Empty text returns empty text, with no extra blank line.
+// Split on spaces. A word longer than the row is cut so it cannot run
+// off the screen. A newline ends the current line. Two newlines in a
+// row leave a blank line, which keeps paragraphs apart. Each output
+// line, including the last, ends with CRLF ("\r\n"). Empty text returns
+// empty text, with no extra blank line.
 //
-// width is the screen size from the -width flag. Classic doors use 40 or 80.
-// A width below 1 is treated as 1.
+// width is the screen size from the -width flag. Classic doors use 40
+// or 80. A row stops one column early (79 on an 80-column screen, 39
+// on 40). A full row makes SyncTERM autowrap, and the CRLF that follows
+// then shows up as a blank line. A width below 1 is treated as 1, and a
+// 1-column screen has no spare column.
 //
 // The text is plain ASCII (see ascii.Sanitize), so len is the column count.
 func Wrap(text string, width int) string {
@@ -35,21 +38,29 @@ func Wrap(text string, width int) string {
 // and writes wrapped lines to out. Each finished line ends with CRLF.
 //
 // A line is written when the next word does not fit, when the input has
-// a newline, or when Flush is called. A line that is exactly width stays
+// a newline, or when Flush is called. A line that fills the row stays
 // buffered until then, so a following newline does not become a blank line.
+// No row uses the screen's last column.
 type LineWriter struct {
 	out   io.Writer
-	width int
-	line  string // words already placed on this row
-	word  string // the word we are still reading
+	width int // columns a row may hold, one less than the screen
+	line  string
+	word  string
 }
 
-// NewLineWriter wraps text to width columns as it is written.
+// NewLineWriter wraps text for a screen of width columns.
 func NewLineWriter(out io.Writer, width int) *LineWriter {
-	if width < 1 {
-		width = 1
+	return &LineWriter{out: out, width: columns(width)}
+}
+
+// columns is how many characters one row may hold.
+// Leave the last screen column empty so the terminal does not autowrap
+// before our CRLF. A one-column screen has nothing to spare.
+func columns(width int) int {
+	if width <= 1 {
+		return 1
 	}
-	return &LineWriter{out: out, width: width}
+	return width - 1
 }
 
 // WriteString adds the next piece of text.
@@ -86,8 +97,9 @@ func (w *LineWriter) one(c byte) error {
 		if len(w.word) <= w.width {
 			return nil
 		}
-		// The word itself is wider than the screen. Finish the current
-		// row first, then cut off a full-width piece.
+		// The word itself is wider than the row. Finish the current
+		// row first, then cut off a piece that still leaves the last
+		// screen column empty.
 		if w.line != "" {
 			if err := w.emit(); err != nil {
 				return err

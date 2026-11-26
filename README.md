@@ -3,7 +3,8 @@
 A BBS door that chats with a local [Ollama](https://ollama.com) server.
 
 The caller types a line. The door sends the conversation to Ollama and
-writes the reply as plain ASCII, wrapped to the screen width. Every line
+writes the reply as plain ASCII, wrapped to one column short of the
+screen width. Every line
 the caller sees ends with CRLF (`\r\n`).
 
 A BBS launches the door with `-dropfile`, pointing at the `DOOR32.SYS`
@@ -31,9 +32,11 @@ Callers on DOS, Apple II, and Commodore 64 terminals need plain bytes:
   Accented letters become the base letter. Emoji and other non-ASCII
   characters are dropped. See `internal/ascii`.
 - **Word wrap at 40 or 80 columns.** Apple II and C64 screens are 40
-  columns; a typical DOS terminal is 80. A word longer than the width
-  is cut so it cannot run off the screen. Every line ends with CRLF
-  (`\r\n`). See `internal/wrap`.
+  columns; a typical DOS terminal is 80. Rows stop one column early
+  (39 or 79). A line that fills the last column makes SyncTERM autowrap,
+  and the following CRLF then looks like a blank line. A word longer
+  than the row is cut so it cannot run off the screen. Every line ends
+  with CRLF (`\r\n`). See `internal/wrap`.
 - **Two themes, no boxes.** `mono` sends no ANSI at all. `green` is a
   blank bright-green-on-black screen and a cursor. See `internal/theme`.
 - **Chat is HTTP to a local Ollama.** `POST /api/chat`, streaming
@@ -210,7 +213,7 @@ and the Synchronet [DOOR.SYS](http://wiki.synchro.net/ref:door.sys) page.
 ```
 main.go                  flags, the drop file, and the stdin loop
 internal/ascii/          Sanitize(string) string
-internal/wrap/           Wrap and LineWriter (CRLF, 40 or 80 columns)
+internal/wrap/           Wrap and LineWriter (CRLF, one column short of 40 or 80)
 internal/ollama/         Client, Chat, and the /api/chat JSON types
 internal/theme/          mono and green
 internal/dropfile/       DOOR32.SYS and DOOR.SYS
@@ -235,7 +238,7 @@ standard library, so the result is a static binary you can copy onto a
 BBS host that does not have Go or a matching C library:
 
 ```sh
-CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.1" -o ollama-door .
+CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.2" -o ollama-door .
 ```
 
 `make build` runs that command. `main.version` is what `-version` prints.
@@ -283,7 +286,8 @@ go run . -model llama3.2 -dropfile examples/door32.sys
 
 The screen clears to black, the greeting says hello to Josh, and the
 cursor sits at `>`. Type a line and press Enter. The reply is plain
-ASCII, wrapped to 80 columns. End the call with `quit`, `/q`, or `bye`.
+ASCII, wrapped to 79 columns on this 80-column screen so the last column
+stays empty. End the call with `quit`, `/q`, or `bye`.
 Closing stdin (Ctrl-D on Unix, Ctrl-Z then Enter on Windows) also ends
 it. That is how the BBS signals that the caller is gone.
 
