@@ -9,7 +9,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -25,6 +24,7 @@ import (
 	"github.com/e14tech/ollama-door/internal/ascii"
 	"github.com/e14tech/ollama-door/internal/config"
 	"github.com/e14tech/ollama-door/internal/dropfile"
+	"github.com/e14tech/ollama-door/internal/lineedit"
 	"github.com/e14tech/ollama-door/internal/ollama"
 	"github.com/e14tech/ollama-door/internal/theme"
 	"github.com/e14tech/ollama-door/internal/wrap"
@@ -36,8 +36,8 @@ const defaultSystem = "You are a helpful AI assistant on a retro BBS. You are no
 
 // version is printed by -version. Override it at build time:
 //
-//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.0" -o ollama-door .
-var version = "1.0.0"
+//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.1" -o ollama-door .
+var version = "1.0.1"
 
 // historyLimit is how many messages we send, counting the system message.
 // Older turns are dropped so a long call does not grow the request forever.
@@ -74,6 +74,11 @@ type session struct {
 	after func(time.Duration) <-chan time.Time
 	// log is the sysop log. Nil means do not log.
 	log *callLog
+	// echo copies keystrokes to the screen. A local terminal already
+	// does that, so auto mode leaves it off there.
+	echo bool
+	// maxInput is the longest line the editor will keep.
+	maxInput int
 }
 
 func main() {
@@ -104,8 +109,11 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	timeout := fs.Duration("timeout", 60*time.Second, "cancel a reply that makes no progress for this long; 0 disables")
 	maxMin := fs.Int("maxmin", 0, "cap session minutes for a sysop; 0 uses the drop file only")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
-	logPath := fs.String("log", "", "log file path; empty logs to stderr only. %n and {node} become the node number")
-	logChat := fs.Bool("logchat", false, "log chat text; off by default")
+	logPath := fs.String("log", "", "log file path; empty means no log file. %n and {node} become the node number")
+	logChat := fs.Bool("logchat", false, "log chat text when -log or -verbose is on")
+	verbose := fs.Bool("verbose", false, "send log lines to stderr for local debugging")
+	echoMode := fs.String("echo", "auto", "echo keystrokes: auto, on, or off")
+	maxInput := fs.Int("maxinput", lineedit.DefaultMax, "max characters on one typed line")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -142,7 +150,8 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	opt = applyFlags(opt, visited, flagOptions{
 		host: *host, model: *model, system: *system, theme: *themeName,
 		width: *width, idle: *idle, timeout: *timeout, maxMin: *maxMin,
-		logPath: *logPath, logChat: *logChat,
+		logPath: *logPath, logChat: *logChat, verbose: *verbose,
+		echo: *echoMode, maxInput: *maxInput,
 	})
 
 	if opt.model == "" {
@@ -170,6 +179,17 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		fs.Usage()
 		return 2
 	}
+	if !validEcho(opt.echo) {
+		fmt.Fprintf(errOut, "ollama-door: -echo must be auto, on, or off\r\n")
+		fs.Usage()
+		return 2
+	}
+	if opt.maxInput < 1 {
+		fmt.Fprintf(errOut, "ollama-door: -maxinput must be at least 1\r\n")
+		fs.Usage()
+		return 2
+	}
+	opt.echo = strings.ToLower(strings.TrimSpace(opt.echo))
 	// Reject a bad theme before any drop-file note, so a typo exits 2
 	// without looking like the door started.
 	if visited["theme"] || themeFromConfig {
@@ -180,7 +200,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		}
 	}
 
-	info, dropOK := loadDropfile(*dropPath, errOut)
+	info, _ := loadDropfile(*dropPath, errOut)
 	th, err := pickTheme(visited["theme"] || themeFromConfig, opt.theme, info.ANSI)
 	if err != nil {
 		fmt.Fprintf(errOut, "ollama-door: -theme must be mono or green\r\n")
@@ -191,17 +211,10 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
 	client := ollama.New(opt.host)
 	minutes, limited := applyMaxMin(info, opt.maxMin)
-	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s timeout=%s maxmin=%d\r\n",
-		opt.model, client.BaseURL, opt.width, th.Name, opt.idle, opt.timeout, opt.maxMin)
-	if dropOK || limited {
-		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t node=%d\r\n",
-			alias, minutes, limited, info.ANSI, info.Node)
-	}
-
-	lg, err := openLog(expandLogPath(opt.logPath, info.Node), info.Node, alias, opt.logChat, errOut)
+	lg, err := openLog(expandLogPath(opt.logPath, info.Node), info.Node, alias, opt.logChat, opt.verbose, errOut)
 	if err != nil {
 		fmt.Fprintf(errOut, "ollama-door: log: %v\r\n", err)
-		lg, _ = openLog("", info.Node, alias, opt.logChat, errOut)
+		lg, _ = openLog("", info.Node, alias, opt.logChat, opt.verbose, errOut)
 	}
 	if lg != nil {
 		defer lg.close()
@@ -219,9 +232,15 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		idle:     opt.idle,
 		timeout:  opt.timeout,
 		log:      lg,
+		echo:     resolveEcho(opt.echo, in),
+		maxInput: opt.maxInput,
 	}
 	if err := client.Ping(ctx); errors.Is(err, ollama.ErrUnreachable) {
-		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		// The caller sees the napping line. The dial error stays in the
+		// log, which is quiet unless -log or -verbose is set.
+		if lg != nil {
+			lg.aiError(err)
+		}
 		s.down = true
 	}
 	if err := run(ctx, in, out, errOut, s); err != nil {
@@ -348,7 +367,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 		}
 	}()
 	if s.log != nil {
-		s.log.event("start", "model", s.model, "theme", s.theme.Name)
+		s.log.event("start", "model", s.model, "theme", s.theme.Name, "width", s.width)
 	}
 	timeUp := func(atPrompt bool) error {
 		reason = "timeup"
@@ -390,10 +409,6 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 		history = append(history, ollama.Message{Role: ollama.RoleSystem, Content: s.system})
 	}
 
-	// readLines cancels hangCtx when stdin ends, so a reply that is
-	// streaming stops even though this loop is inside takeTurn.
-	lines := readLines(hangCtx, hangCancel, in)
-
 	prompt := func() error {
 		_, err := io.WriteString(out, "> ")
 		return err
@@ -401,6 +416,10 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	if err := prompt(); err != nil {
 		return nil
 	}
+	// Start the reader after the prompt so a pipe full of input is
+	// echoed under "> ", not in front of the banner. It still runs
+	// during takeTurn, so stdin closing cancels a reply in progress.
+	lines := readLines(hangCtx, hangCancel, in, out, s.echo, s.maxInput)
 	// Idle timers are replaced after every line. Session warnings are
 	// armed once, from the start of the call, and stay in this select.
 	// Neither set is read while takeTurn is streaming.
@@ -556,48 +575,92 @@ type lineEvent struct {
 	err  error
 }
 
-// readLines scans r on its own goroutine. Scan blocks, so the prompt
-// loop cannot select on it directly. Each finished line is sent on the
-// returned channel.
+// readLines reads r on its own goroutine. The editor blocks in Read, so
+// the prompt loop cannot select on it directly. Each finished line is
+// sent on the returned channel. echo and maxInput come from -echo and
+// -maxinput.
 //
 // The goroutine exits in one of three ways:
 //
-//  1. Scan returns. That is EOF or a read error. defer cancel() runs
-//     first, which aborts a streaming reply, and then the channel is
-//     closed. A read error is sent if the prompt loop is still receiving.
+//  1. The editor returns. That is EOF or a read error. defer cancel()
+//     runs first, which aborts a streaming reply, and then the channel
+//     is closed. A read error is sent if the prompt loop is still receiving.
 //  2. It is blocked sending a line and ctx is canceled. The select takes
 //     ctx.Done() and returns, so shutdown does not wait on that send.
-//  3. Scan is blocked inside Read. A context cannot interrupt that call.
-//     Closing stdin unblocks it. The BBS does that when the carrier drops.
-//     Exiting the process does too.
+//  3. The editor is blocked inside Read. A context cannot interrupt that
+//     call. Closing stdin unblocks it. The BBS does that when the carrier
+//     drops. Exiting the process does too.
 //
 // cancel may run more than once. run also cancels on the way out, which
 // wakes a goroutine stuck on the send in case 2.
-func readLines(ctx context.Context, cancel context.CancelFunc, r io.Reader) <-chan lineEvent {
+func readLines(ctx context.Context, cancel context.CancelFunc, r io.Reader, out io.Writer, echo bool, maxInput int) <-chan lineEvent {
 	ch := make(chan lineEvent)
 	go func() {
 		defer close(ch)
 		defer cancel()
-		sc := bufio.NewScanner(r)
-		for sc.Scan() {
-			ev := lineEvent{text: sc.Text()}
-			select {
-			case <-ctx.Done():
-				return
-			case ch <- ev:
+		ed := lineedit.New(r, out, lineedit.Options{Echo: echo, Max: maxInput})
+		for {
+			line, err := ed.Next()
+			if err == nil || line != "" {
+				select {
+				case <-ctx.Done():
+					return
+				case ch <- lineEvent{text: line}:
+				}
 			}
-		}
-		if err := sc.Err(); err != nil {
-			// Cancel before the send. takeTurn may be blocked in Chat
-			// and will not be reading this channel.
-			cancel()
-			select {
-			case <-ctx.Done():
-			case ch <- lineEvent{err: err}:
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				// Cancel before the send. takeTurn may be blocked in Chat
+				// and will not be reading this channel.
+				cancel()
+				select {
+				case <-ctx.Done():
+				case ch <- lineEvent{err: err}:
+				}
+				return
 			}
 		}
 	}()
 	return ch
+}
+
+// validEcho reports whether s is auto, on, or off.
+func validEcho(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "auto", "on", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveEcho decides whether the door should echo keystrokes.
+// auto echoes when stdin is not a character device. Synchronet Standard
+// I/O hands the door a socket, so echo turns on. A shell session is a
+// terminal, and that terminal already echoes, so auto stays quiet.
+func resolveEcho(mode string, in io.Reader) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "on":
+		return true
+	case "off":
+		return false
+	default:
+		return !isCharDevice(in)
+	}
+}
+
+func isCharDevice(in io.Reader) bool {
+	f, ok := in.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 // hangOrErr turns a carrier failure into a nil error so the process
@@ -818,7 +881,8 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	elapsed := time.Since(started)
 	if err != nil {
 		history = history[:len(history)-1]
-		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		// The caller already sees friendlyAI. The raw error stays in the
+		// log, which is discarded unless -log or -verbose is on.
 		if s.log != nil {
 			s.log.aiError(err)
 			s.log.turn(elapsed, len(line), spoken.Len(), line, spoken.String())

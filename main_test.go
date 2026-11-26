@@ -180,6 +180,9 @@ func TestRealMainNoDropfileNote(t *testing.T) {
 	if !strings.Contains(errOut.String(), "no -dropfile") {
 		t.Fatalf("stderr %q", errOut.String())
 	}
+	if strings.Contains(errOut.String(), "level=INFO") || strings.Contains(out.String(), "level=INFO") {
+		t.Fatalf("log lines leaked: stderr %q out %q", errOut.String(), out.String())
+	}
 	if strings.Contains(out.String(), "\x1b") {
 		t.Fatal("mono output contains an escape")
 	}
@@ -346,8 +349,8 @@ func TestRealMainOllamaErrorContinues(t *testing.T) {
 	if !strings.Contains(out.String(), msgNoModel) || !strings.Contains(out.String(), "Goodbye.\r\n") {
 		t.Fatalf("out %q", out.String())
 	}
-	if !strings.Contains(errOut.String(), "404") {
-		t.Fatalf("stderr %q", errOut.String())
+	if strings.Contains(errOut.String(), "level=INFO") || strings.Contains(errOut.String(), "model not found") {
+		t.Fatalf("raw log leaked to stderr: %q", errOut.String())
 	}
 }
 
@@ -1078,8 +1081,8 @@ func TestFriendlyErrorsAndHistory(t *testing.T) {
 	if strings.Contains(text, "\x1b") {
 		t.Fatal("friendly text contained an escape")
 	}
-	if !strings.Contains(errOut.String(), "404") {
-		t.Fatalf("stderr %q", errOut.String())
+	if strings.Contains(errOut.String(), "level=INFO") || strings.Contains(errOut.String(), "model not found") {
+		t.Fatalf("raw log leaked to stderr: %q", errOut.String())
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -1206,8 +1209,8 @@ func TestStallTimeout(t *testing.T) {
 	if !strings.Contains(out.String(), msgSlow+"\r\n") || !strings.Contains(out.String(), "Goodbye.\r\n") {
 		t.Fatalf("out %q stderr %q", out.String(), errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "ollama") {
-		t.Fatalf("stderr %q", errOut.String())
+	if strings.Contains(errOut.String(), "level=INFO") || strings.Contains(errOut.String(), "event=turn") {
+		t.Fatalf("turn log leaked to stderr: %q", errOut.String())
 	}
 }
 
@@ -1235,8 +1238,22 @@ func TestClosedListenerNapping(t *testing.T) {
 	if !strings.Contains(text, "Goodbye.\r\n") {
 		t.Fatalf("did not return to the prompt: %q", text)
 	}
+	if strings.Contains(errOut.String(), "unreachable") || strings.Contains(errOut.String(), "level=") {
+		t.Fatalf("startup detail leaked: %q", errOut.String())
+	}
+
+	errOut.Reset()
+	out.Reset()
+	code = realMain(context.Background(),
+		[]string{"-model", "m", "-host", "http://" + addr, "-theme", "mono", "-idle", "0", "-verbose"},
+		strings.NewReader("quit\n"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("verbose code %d stderr %q", code, errOut.String())
+	}
 	if !strings.Contains(errOut.String(), "unreachable") && !strings.Contains(errOut.String(), "connection") {
-		t.Fatalf("stderr %q", errOut.String())
+		t.Fatalf("verbose stderr %q", errOut.String())
 	}
 }
 
@@ -1266,6 +1283,51 @@ func TestVersionFlag(t *testing.T) {
 	}
 }
 
+func TestOpenLogDiscardsByDefault(t *testing.T) {
+	var stderr bytes.Buffer
+	lg, err := openLog("", 1, "Josh", true, false, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.close()
+	if lg.logChat {
+		t.Fatal("-logchat applies only when logging is enabled")
+	}
+	lg.event("start")
+	lg.turn(time.Second, 4, 8, "secret question", "secret answer")
+	lg.aiError(os.ErrNotExist)
+	lg.end("quit")
+	if stderr.Len() != 0 {
+		t.Fatalf("default logger wrote %q", stderr.String())
+	}
+
+	lg, err = openLog("", 1, "Josh", false, true, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.event("start")
+	if !strings.Contains(stderr.String(), "event=start") || !strings.Contains(stderr.String(), "level=INFO") {
+		t.Fatalf("verbose stderr %q", stderr.String())
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.log")
+	stderr.Reset()
+	fileLog, err := openLog(path, 1, "Josh", false, false, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileLog.aiError(os.ErrNotExist)
+	fileLog.close()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "level=ERROR") || stderr.Len() != 0 {
+		t.Fatalf("file %q stderr %q", body, stderr.String())
+	}
+}
+
 func TestExpandLogPath(t *testing.T) {
 	got := expandLogPath("/var/log/door-%n-{node}.log", 4)
 	if got != "/var/log/door-4-4.log" {
@@ -1276,7 +1338,7 @@ func TestExpandLogPath(t *testing.T) {
 func TestLogOmitsChatUnlessAsked(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "n-%n.log")
-	lg, err := openLog(expandLogPath(path, 2), 2, "Ada", false, io.Discard)
+	lg, err := openLog(expandLogPath(path, 2), 2, "Ada", false, false, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1300,7 +1362,7 @@ func TestLogOmitsChatUnlessAsked(t *testing.T) {
 	}
 
 	chatPath := filepath.Join(dir, "chat.log")
-	chatLog, err := openLog(chatPath, 2, "Ada", true, io.Discard)
+	chatLog, err := openLog(chatPath, 2, "Ada", true, false, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,7 +1413,7 @@ func TestConfigFileSuppliesModel(t *testing.T) {
 	}
 	var out, errOut bytes.Buffer
 	code := realMain(context.Background(),
-		[]string{"-config", path, "-theme", "mono", "-idle", "0"},
+		[]string{"-config", path, "-theme", "mono", "-idle", "0", "-verbose"},
 		strings.NewReader("quit\n"),
 		&out, &errOut,
 	)
@@ -1363,6 +1425,71 @@ func TestConfigFileSuppliesModel(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Goodbye.\r\n") {
 		t.Fatalf("out %q", out.String())
+	}
+}
+
+func TestRealMainEnterIsCR(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-model", "m", "-theme", "mono", "-idle", "0"},
+		strings.NewReader("quit\r"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "> quit\r\n") || !strings.Contains(text, "Goodbye.\r\n") {
+		t.Fatalf("out %q", text)
+	}
+}
+
+func TestRealMainEchoOff(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-model", "m", "-theme", "mono", "-idle", "0", "-echo", "off"},
+		strings.NewReader("quit\r"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	if strings.Contains(out.String(), "> quit") {
+		t.Fatalf("echoed while off: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.\r\n") {
+		t.Fatalf("out %q", out.String())
+	}
+}
+
+func TestResolveEcho(t *testing.T) {
+	if !resolveEcho("auto", strings.NewReader("")) {
+		t.Fatal("a pipe should echo in auto mode")
+	}
+	if resolveEcho("off", strings.NewReader("")) {
+		t.Fatal("off should not echo")
+	}
+	if !resolveEcho("on", strings.NewReader("")) {
+		t.Fatal("on should echo")
+	}
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if resolveEcho("auto", f) {
+		t.Fatal("a character device should not echo in auto mode")
+	}
+	if !resolveEcho("ON", f) {
+		t.Fatal("on should echo on a character device")
+	}
+}
+
+func TestRealMainBadEcho(t *testing.T) {
+	var errOut bytes.Buffer
+	code := realMain(context.Background(), []string{"-model", "m", "-echo", "tty"}, strings.NewReader(""), io.Discard, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "-echo must be auto, on, or off") {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
 	}
 }
 

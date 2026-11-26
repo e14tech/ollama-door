@@ -28,13 +28,23 @@ func expandLogPath(path string, node int) string {
 	return path
 }
 
-// openLog writes text slog lines to stderr, and also to path when path
-// is not empty. The caller should close the result.
-func openLog(path string, node int, alias string, logChat bool, stderr io.Writer) (*callLog, error) {
+// openLog builds the sysop logger.
+// With no path and verbose false, the handler discards every line so a
+// normal door session stays quiet. -log writes the file. -verbose copies
+// the same lines to stderr. -logchat is ignored unless one of those is on.
+func openLog(path string, node int, alias string, logChat, verbose bool, stderr io.Writer) (*callLog, error) {
+	if path == "" && !verbose {
+		return &callLog{
+			l:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			node:    node,
+			alias:   alias,
+			logChat: false,
+		}, nil
+	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	w := stderr
+	var writers []io.Writer
 	var f *os.File
 	if path != "" {
 		var err error
@@ -42,7 +52,14 @@ func openLog(path string, node int, alias string, logChat bool, stderr io.Writer
 		if err != nil {
 			return nil, err
 		}
-		w = io.MultiWriter(stderr, f)
+		writers = append(writers, f)
+	}
+	if verbose {
+		writers = append(writers, stderr)
+	}
+	var w io.Writer = writers[0]
+	if len(writers) > 1 {
+		w = io.MultiWriter(writers...)
 	}
 	return &callLog{
 		l:       slog.New(slog.NewTextHandler(w, nil)),

@@ -2,50 +2,60 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/e14tech/ollama-door/internal/config"
+	"github.com/e14tech/ollama-door/internal/lineedit"
 )
 
 // options is the door's settings after defaults, the config file, and
 // explicit flags have been merged.
 type options struct {
-	host    string
-	model   string
-	system  string
-	theme   string
-	width   int
-	idle    time.Duration
-	timeout time.Duration
-	maxMin  int
-	logPath string
-	logChat bool
+	host     string
+	model    string
+	system   string
+	theme    string
+	width    int
+	idle     time.Duration
+	timeout  time.Duration
+	maxMin   int
+	logPath  string
+	logChat  bool
+	verbose  bool
+	echo     string
+	maxInput int
 }
 
 func defaultOptions() options {
 	return options{
-		host:    "http://localhost:11434",
-		system:  defaultSystem,
-		theme:   "mono",
-		width:   80,
-		idle:    5 * time.Minute,
-		timeout: 60 * time.Second,
+		host:     "http://localhost:11434",
+		system:   defaultSystem,
+		theme:    "mono",
+		width:    80,
+		idle:     5 * time.Minute,
+		timeout:  60 * time.Second,
+		echo:     "auto",
+		maxInput: lineedit.DefaultMax,
 	}
 }
 
 // flagOptions is the values flag.Parse stored. applyFlags copies a field
 // only when that flag was present on the command line.
 type flagOptions struct {
-	host    string
-	model   string
-	system  string
-	theme   string
-	width   int
-	idle    time.Duration
-	timeout time.Duration
-	maxMin  int
-	logPath string
-	logChat bool
+	host     string
+	model    string
+	system   string
+	theme    string
+	width    int
+	idle     time.Duration
+	timeout  time.Duration
+	maxMin   int
+	logPath  string
+	logChat  bool
+	verbose  bool
+	echo     string
+	maxInput int
 }
 
 // applyConfig copies keys that the file actually set.
@@ -91,6 +101,21 @@ func applyConfig(o options, file config.File) (options, bool, error) {
 	if file.LogChat != nil {
 		o.logChat = *file.LogChat
 	}
+	if file.Verbose != nil {
+		o.verbose = *file.Verbose
+	}
+	if file.Echo != nil {
+		if !validEcho(*file.Echo) {
+			return o, false, fmt.Errorf("echo: must be auto, on, or off")
+		}
+		o.echo = strings.ToLower(strings.TrimSpace(*file.Echo))
+	}
+	if file.MaxInput != nil {
+		if *file.MaxInput < 1 {
+			return o, false, fmt.Errorf("maxinput: must be at least 1")
+		}
+		o.maxInput = *file.MaxInput
+	}
 	return o, themeSet, nil
 }
 
@@ -126,6 +151,15 @@ func applyFlags(o options, visited map[string]bool, f flagOptions) options {
 	}
 	if visited["logchat"] {
 		o.logChat = f.logChat
+	}
+	if visited["verbose"] {
+		o.verbose = f.verbose
+	}
+	if visited["echo"] {
+		o.echo = f.echo
+	}
+	if visited["maxinput"] {
+		o.maxInput = f.maxInput
 	}
 	return o
 }
