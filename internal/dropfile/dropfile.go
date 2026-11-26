@@ -21,6 +21,9 @@ type Info struct {
 	// A missing line leaves HasLimit false, which means no session clock.
 	// No drop file at all is the same idea, and never reaches Parse.
 	HasLimit bool
+	// Node is the BBS node number. 0 means the file did not say.
+	// DOOR32.SYS line 11, DOOR.SYS line 4.
+	Node int
 }
 
 // Parse reads a DOOR32.SYS or DOOR.SYS file. The format comes from the
@@ -94,6 +97,7 @@ func parseMinutes(s string) (n int, ok bool) {
 //	7   handle / alias
 //	9   minutes left
 //	10  emulation: 0 ASCII, 1 ANSI, 2 Avatar, 3 RIP, 4 Max Graphics
+//	11  node number
 //
 // The spec says Avatar, RIP, and Max Graphics all have an ANSI fallback,
 // so emulation 1 through 4 sets ANSI. Emulation 0 stays ASCII.
@@ -112,6 +116,7 @@ func parseDoor32(lines []string) Info {
 		ANSI:        ansi,
 		MinutesLeft: mins,
 		HasLimit:    has,
+		Node:        parseNode(field(lines, 11)),
 	}
 }
 
@@ -123,6 +128,7 @@ func parseDoor32(lines []string) Info {
 //
 // Lines this door uses (1-based):
 //
+//	4   node number
 //	10  full name. Synchronet may put the alias here when "Use Real Name" is off.
 //	19  minutes remaining this call
 //	20  graphics mode: GR, NG, or 7E
@@ -146,5 +152,18 @@ func parseDoorSys(lines []string) Info {
 		ANSI:        strings.EqualFold(field(lines, 20), "GR"),
 		MinutesLeft: mins,
 		HasLimit:    has,
+		Node:        parseNode(field(lines, 4)),
 	}
+}
+
+// parseNode reads a node number. Missing or non-numeric text is 0.
+func parseNode(s string) int {
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }

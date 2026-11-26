@@ -62,7 +62,11 @@ caller  ->  BBS (telnet/ssh)  ->  stdin  ->  ollama-door
 | `-idle` | `5m` | Hang up if the caller types nothing for this long. `0` turns it off |
 | `-timeout` | `60s` | Cancel a reply that sits with no new text for this long. `0` turns it off |
 | `-maxmin` | `0` | Cap the session minutes. `0` uses the drop file only |
-| `-system` | a short sysop prompt | First chat message. The default asks for short plain-ASCII answers |
+| `-system` | built-in assistant prompt | First chat message. The default says the model is not the sysop and not a person |
+| `-config` | none | Optional JSON file. Explicit flags override it |
+| `-log` | stderr only | Log file path. `%n` and `{node}` become the node number |
+| `-logchat` | off | Also write the chat text into the log |
+| `-version` |  | Print the version and exit |
 
 `-theme` and `-width` are for a local test and for a sysop who wants to
 force a setting. When `-theme` is left off, an ANSI caller (drop file
@@ -143,7 +147,9 @@ in all, so a long call does not grow the request without limit.
 `mono` is the safe theme. The door writes text and CRLF only.
 
 `green` is a period CRT: bright green on black, using only the original
-16-color SGR codes. The sequence is:
+16-color SGR codes. The door does not pick the shade of green. A terminal
+program such as [SyncTERM](https://syncterm.bbsdev.net/) does, from its
+palette. The sequence is:
 
 ```
 ESC[0;1;32;40m ESC[2J ESC[H ESC[0;1;32;40m
@@ -204,6 +210,8 @@ internal/ollama/         Client, Chat, and the /api/chat JSON types
 internal/theme/          mono and green
 internal/dropfile/       DOOR32.SYS and DOOR.SYS
 examples/door32.sys      a sample drop file for a local test
+examples/ollama-door.json sample sysop config
+CHANGELOG.md             release notes
 ```
 
 `internal` means only this module can import those packages. Each
@@ -222,8 +230,10 @@ standard library, so the result is a static binary you can copy onto a
 BBS host that does not have Go or a matching C library:
 
 ```sh
-CGO_ENABLED=0 go build -o ollama-door .
+CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.0" -o ollama-door .
 ```
+
+`make build` runs that command. `main.version` is what `-version` prints.
 
 Cross-compile from your laptop for the BBS machine. `GOOS` and `GOARCH`
 pick the target. The binary is still named `ollama-door`.
@@ -307,10 +317,11 @@ The settings that matter for this door:
 
 | SCFG field | Value |
 | --- | --- |
-| Start-up Directory | the directory you copied the binary into |
-| Command Line | see below |
+| Start-up Directory | `../xtrn/ollama-door` |
+| Command Line | `ollama-door -dropfile %f -config ollama-door.json` |
 | Native Executable | Yes |
 | I/O Method | Standard |
+| Multiple Concurrent Users | Yes |
 | Use Shell or New Context | No |
 | BBS Drop File Type | `DOOR32.SYS` |
 | Place Drop File In | Node Directory |
@@ -319,23 +330,42 @@ I/O Method `Standard` connects the caller's terminal to stdin and stdout.
 `Socket` is for a door that takes the TCP handle out of `DOOR32.SYS`
 line 2. This door does not. It reads and writes the standard streams.
 
-Command line, with the binary wherever you installed it:
+Put `examples/ollama-door.json` next to the binary and edit the model
+name. The command line in the table is enough: `%f` is the drop file
+Synchronet just wrote. On Linux that name is often lowercase
+(`door32.sys`). The door matches either.
 
-```
-/home/josh/bin/ollama-door -model llama3.2 -dropfile %F
+`%F` is the same path without automatic quotes. Use it when Use Shell
+or New Context is No and the path has no spaces. `%w` is the caller's
+column count if you want `-width %w` as well.
+
+A sample config:
+
+```json
+{
+  "host": "http://127.0.0.1:11434",
+  "model": "llama3.2",
+  "theme": "green",
+  "width": 80,
+  "idle": "5m",
+  "timeout": "60s",
+  "maxmin": 30,
+  "log": "ollama-door-%n.log",
+  "logchat": false
+}
 ```
 
-`%F` is the drop file path. The wiki's Unix example of that specifier
-is `/sbbs/node1/door.sys`. On Linux the name is often lowercase
-(`door32.sys`). The door matches either. `%f` is the same path with
-shell quoting; leave the shell off and use `%F` unless the path has a
-space in it.
+Built-in defaults fill any key you leave out. A flag typed on the
+command line replaces the file. `-theme` on the command line also
+replaces the drop file's ANSI choice. A theme that appears only in the
+config file does that too.
 
-To follow the caller's column count, add the width specifier:
-
-```
-/home/josh/bin/ollama-door -model llama3.2 -dropfile %F -width %w
-```
+The log is `log/slog` text. Each line has a timestamp, the node, the
+alias, and an event: `start`, `end` with a reason (`quit`, `idle`,
+`timeup`, or `hangup`), `ollama_error`, or `turn` (how long the reply
+took, and how many characters moved). The words of the chat stay out
+of the file unless `logchat` is true. `%n` and `{node}` in the path
+become the node number from `DOOR32.SYS` line 11 or `DOOR.SYS` line 4.
 
 `%w` is the client's terminal width. Leave `-theme` off so the drop
 file picks `green` or `mono`.
