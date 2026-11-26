@@ -23,14 +23,21 @@ import (
 	"time"
 
 	"github.com/e14tech/ollama-door/internal/ascii"
+	"github.com/e14tech/ollama-door/internal/config"
 	"github.com/e14tech/ollama-door/internal/dropfile"
 	"github.com/e14tech/ollama-door/internal/ollama"
 	"github.com/e14tech/ollama-door/internal/theme"
 	"github.com/e14tech/ollama-door/internal/wrap"
 )
 
-// defaultSystem is used when the caller does not pass -system.
-const defaultSystem = "You are the friendly AI sysop of a retro BBS. Reply in plain ASCII only, no markdown, emoji, or special characters. Keep answers short, under 6 lines."
+// defaultSystem is used when the caller does not pass -system and the
+// config file does not set one. The model is an assistant, not the sysop.
+const defaultSystem = "You are a helpful AI assistant on a retro BBS. You are not the sysop and not a person; never invent a name or backstory. Reply in plain ASCII only, no markdown, emoji, or special characters. Keep answers short, under 6 lines, even if asked for more."
+
+// version is printed by -version. Override it at build time:
+//
+//	CGO_ENABLED=0 go build -ldflags "-X main.version=1.0.0" -o ollama-door .
+var version = "1.0.0"
 
 // historyLimit is how many messages we send, counting the system message.
 // Older turns are dropped so a long call does not grow the request forever.
@@ -65,6 +72,8 @@ type session struct {
 	// after starts a timer. Nil means time.After. Tests pass a fake
 	// so they can fire the warning without waiting minutes.
 	after func(time.Duration) <-chan time.Time
+	// log is the sysop log. Nil means do not log.
+	log *callLog
 }
 
 func main() {
@@ -84,8 +93,10 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 		fs.PrintDefaults()
 	}
 
+	showVersion := fs.Bool("version", false, "print the version and exit")
+	configPath := fs.String("config", "", "optional JSON config file")
 	host := fs.String("host", "http://localhost:11434", "Ollama server base URL")
-	model := fs.String("model", "", "Ollama model name (required)")
+	model := fs.String("model", "", "Ollama model name (required unless set in -config)")
 	dropPath := fs.String("dropfile", "", "path to DOOR32.SYS or DOOR.SYS (how a BBS launches the door)")
 	width := fs.Int("width", 80, "optional column override for a local test; classic terminals use 40 or 80")
 	themeName := fs.String("theme", "mono", "optional theme override: mono or green (default: from the drop file)")
@@ -93,48 +104,76 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	timeout := fs.Duration("timeout", 60*time.Second, "cancel a reply that makes no progress for this long; 0 disables")
 	maxMin := fs.Int("maxmin", 0, "cap session minutes for a sysop; 0 uses the drop file only")
 	system := fs.String("system", defaultSystem, "system prompt sent as the first chat message")
+	logPath := fs.String("log", "", "log file path; empty logs to stderr only. %n and {node} become the node number")
+	logChat := fs.Bool("logchat", false, "log chat text; off by default")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if *model == "" {
+	if *showVersion {
+		fmt.Fprintf(out, "ollama-door %s\n", version)
+		return 0
+	}
+
+	// flag.Visit lists only flags the operator typed. That is how a
+	// config file can fill the gaps without blocking an explicit flag.
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+
+	opt := defaultOptions()
+	themeFromConfig := false
+	if *configPath != "" {
+		file, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintf(errOut, "ollama-door: config: %v\r\n", err)
+			return 2
+		}
+		var errApply error
+		opt, themeFromConfig, errApply = applyConfig(opt, file)
+		if errApply != nil {
+			fmt.Fprintf(errOut, "ollama-door: config: %v\r\n", errApply)
+			return 2
+		}
+	}
+	opt = applyFlags(opt, visited, flagOptions{
+		host: *host, model: *model, system: *system, theme: *themeName,
+		width: *width, idle: *idle, timeout: *timeout, maxMin: *maxMin,
+		logPath: *logPath, logChat: *logChat,
+	})
+
+	if opt.model == "" {
 		fmt.Fprintf(errOut, "ollama-door: -model is required\r\n")
 		fs.Usage()
 		return 2
 	}
-	if *width < 1 {
+	if opt.width < 1 {
 		fmt.Fprintf(errOut, "ollama-door: -width must be at least 1\r\n")
 		fs.Usage()
 		return 2
 	}
-	if *idle < 0 {
+	if opt.idle < 0 {
 		fmt.Fprintf(errOut, "ollama-door: -idle must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
-	if *timeout < 0 {
+	if opt.timeout < 0 {
 		fmt.Fprintf(errOut, "ollama-door: -timeout must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
-	if *maxMin < 0 {
+	if opt.maxMin < 0 {
 		fmt.Fprintf(errOut, "ollama-door: -maxmin must be 0 or positive\r\n")
 		fs.Usage()
 		return 2
 	}
-
-	themeSet := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "theme" {
-			themeSet = true
-		}
-	})
-	// Reject a bad -theme before any drop-file note, so a typo exits 2
+	// Reject a bad theme before any drop-file note, so a typo exits 2
 	// without looking like the door started.
-	if themeSet {
-		if _, err := theme.Parse(*themeName); err != nil {
+	if visited["theme"] || themeFromConfig {
+		if _, err := theme.Parse(opt.theme); err != nil {
 			fmt.Fprintf(errOut, "ollama-door: -theme must be mono or green\r\n")
 			fs.Usage()
 			return 2
@@ -142,7 +181,7 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	}
 
 	info, dropOK := loadDropfile(*dropPath, errOut)
-	th, err := pickTheme(themeSet, *themeName, info.ANSI)
+	th, err := pickTheme(visited["theme"] || themeFromConfig, opt.theme, info.ANSI)
 	if err != nil {
 		fmt.Fprintf(errOut, "ollama-door: -theme must be mono or green\r\n")
 		fs.Usage()
@@ -150,26 +189,36 @@ func realMain(ctx context.Context, args []string, in io.Reader, out, errOut io.W
 	}
 
 	alias := strings.TrimSpace(ascii.Sanitize(info.Alias))
-	client := ollama.New(*host)
-	minutes, limited := applyMaxMin(info, *maxMin)
+	client := ollama.New(opt.host)
+	minutes, limited := applyMaxMin(info, opt.maxMin)
 	fmt.Fprintf(errOut, "ollama-door: model=%s host=%s width=%d theme=%s idle=%s timeout=%s maxmin=%d\r\n",
-		*model, client.BaseURL, *width, th.Name, *idle, *timeout, *maxMin)
+		opt.model, client.BaseURL, opt.width, th.Name, opt.idle, opt.timeout, opt.maxMin)
 	if dropOK || limited {
-		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t\r\n",
-			alias, minutes, limited, info.ANSI)
+		fmt.Fprintf(errOut, "ollama-door: caller=%s minutes=%d limit=%t ansi=%t node=%d\r\n",
+			alias, minutes, limited, info.ANSI, info.Node)
+	}
+
+	lg, err := openLog(expandLogPath(opt.logPath, info.Node), info.Node, alias, opt.logChat, errOut)
+	if err != nil {
+		fmt.Fprintf(errOut, "ollama-door: log: %v\r\n", err)
+		lg, _ = openLog("", info.Node, alias, opt.logChat, errOut)
+	}
+	if lg != nil {
+		defer lg.close()
 	}
 
 	s := session{
 		client:   client,
-		model:    *model,
-		system:   withCaller(*system, alias),
-		width:    *width,
+		model:    opt.model,
+		system:   withCaller(opt.system, alias),
+		width:    opt.width,
 		theme:    th,
 		alias:    alias,
 		minutes:  minutes,
 		deadline: sessionDeadline(minutes, limited),
-		idle:     *idle,
-		timeout:  *timeout,
+		idle:     opt.idle,
+		timeout:  opt.timeout,
+		log:      lg,
 	}
 	if err := client.Ping(ctx); errors.Is(err, ollama.ErrUnreachable) {
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
@@ -290,6 +339,22 @@ func sessionWarns(minutes int) (five, one time.Duration, fiveOn, oneOn bool) {
 }
 
 func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) error {
+	// reason is what the log records when the call ends. Hangup is the
+	// default because most early returns are a dropped carrier.
+	reason := "hangup"
+	defer func() {
+		if s.log != nil {
+			s.log.end(reason)
+		}
+	}()
+	if s.log != nil {
+		s.log.event("start", "model", s.model, "theme", s.theme.Name)
+	}
+	timeUp := func(atPrompt bool) error {
+		reason = "timeup"
+		return hangOrErr(writeTimeUp(out, atPrompt))
+	}
+
 	// hangCtx is the carrier. It is canceled by SIGHUP, SIGINT, SIGTERM
 	// (the parent ctx), by stdin closing, or by the first stdout error.
 	// Chat uses this context, so a hangup aborts the HTTP request.
@@ -311,7 +376,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 	sessCtx, sessCancel := sessionContext(context.WithoutCancel(ctx), s.deadline)
 	defer sessCancel()
 	if sessionOver(sessCtx) {
-		return hangOrErr(writeTimeUp(out, false))
+		return timeUp(false)
 	}
 	if s.down {
 		// The server was down at startup. Say so, then still offer the prompt.
@@ -353,7 +418,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
 			return nil
 
@@ -364,7 +429,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
 			line := strings.TrimSpace(ev.text)
 			if line == "" {
@@ -375,6 +440,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				continue
 			}
 			if isQuit(line) {
+				reason = "quit"
 				_, err := io.WriteString(out, "Goodbye.\r\n")
 				return hangOrErr(err)
 			}
@@ -395,9 +461,10 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 			// A reply in progress is not cut off by the session clock.
 			// When it returns, the minutes may already have run out.
 			if errors.Is(err, errTimeUp) || sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, false))
+				return timeUp(false)
 			}
 			if err != nil {
+				reason = "error"
 				return err
 			}
 			if err := prompt(); err != nil {
@@ -411,7 +478,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
 			if err := writeNotice(out, "1 minute left."); err != nil {
 				return nil
@@ -426,7 +493,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
 			if err := writeNotice(out, "5 minutes left."); err != nil {
 				return nil
@@ -442,7 +509,7 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
 			if err := writeNotice(out, "Still there? One minute left."); err != nil {
 				return nil
@@ -456,8 +523,9 @@ func run(ctx context.Context, in io.Reader, out, errOut io.Writer, s session) er
 				return nil
 			}
 			if sessionOver(sessCtx) {
-				return hangOrErr(writeTimeUp(out, true))
+				return timeUp(true)
 			}
+			reason = "idle"
 			_, err := io.WriteString(out, "\r\nIdle too long. Goodbye!\r\n")
 			return hangOrErr(err)
 		}
@@ -727,6 +795,7 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 
 	lw := wrap.NewLineWriter(out, s.width)
 	var spoken strings.Builder
+	started := time.Now()
 	_, err := s.client.Chat(reqCtx, ollama.ChatRequest{
 		Model:    s.model,
 		Messages: history,
@@ -746,9 +815,14 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	if writerFailed(out) || errors.Is(err, context.Canceled) || isCarrier(err) {
 		return history, errHangup
 	}
+	elapsed := time.Since(started)
 	if err != nil {
 		history = history[:len(history)-1]
 		fmt.Fprintf(errOut, "ollama-door: %v\r\n", err)
+		if s.log != nil {
+			s.log.aiError(err)
+			s.log.turn(elapsed, len(line), spoken.Len(), line, spoken.String())
+		}
 		if _, werr := io.WriteString(out, friendlyAI(err)+"\r\n"); werr != nil {
 			return history, errHangup
 		}
@@ -756,6 +830,9 @@ func (s session) takeTurn(ctx context.Context, out, errOut io.Writer, history []
 	}
 	if flushErr != nil {
 		return history, flushErr
+	}
+	if s.log != nil {
+		s.log.turn(elapsed, len(line), spoken.Len(), line, spoken.String())
 	}
 	history = append(history, ollama.Message{
 		Role:    ollama.RoleAssistant,

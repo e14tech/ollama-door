@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/e14tech/ollama-door/internal/config"
 	"github.com/e14tech/ollama-door/internal/dropfile"
 	"github.com/e14tech/ollama-door/internal/ollama"
 	"github.com/e14tech/ollama-door/internal/theme"
@@ -1236,6 +1237,132 @@ func TestClosedListenerNapping(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "unreachable") && !strings.Contains(errOut.String(), "connection") {
 		t.Fatalf("stderr %q", errOut.String())
+	}
+}
+
+func TestDefaultSystemIsNotTheSysop(t *testing.T) {
+	if strings.Contains(defaultSystem, "You are the friendly AI sysop") {
+		t.Fatal(defaultSystem)
+	}
+	for _, phrase := range []string{"not the sysop", "not a person", "plain ASCII", "under 6 lines"} {
+		if !strings.Contains(defaultSystem, phrase) {
+			t.Fatalf("missing %q in %s", phrase, defaultSystem)
+		}
+	}
+	got := withCaller(defaultSystem, "Josh")
+	if !strings.Contains(got, "The caller's name is Josh.") {
+		t.Fatal(got)
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(), []string{"-version"}, strings.NewReader(""), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), version) {
+		t.Fatalf("out %q", out.String())
+	}
+}
+
+func TestExpandLogPath(t *testing.T) {
+	got := expandLogPath("/var/log/door-%n-{node}.log", 4)
+	if got != "/var/log/door-4-4.log" {
+		t.Fatal(got)
+	}
+}
+
+func TestLogOmitsChatUnlessAsked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "n-%n.log")
+	lg, err := openLog(expandLogPath(path, 2), 2, "Ada", false, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.event("start")
+	lg.turn(time.Second, 5, 7, "secret question", "secret answer")
+	lg.end("quit")
+	lg.close()
+
+	b, err := os.ReadFile(filepath.Join(dir, "n-2.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	for _, want := range []string{"event=start", "event=turn", "event=end", "reason=quit", "node=2", "alias=Ada", "user_chars=5", "assistant_chars=7"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %s in %s", want, text)
+		}
+	}
+	if strings.Contains(text, "secret") {
+		t.Fatalf("chat text leaked: %s", text)
+	}
+
+	chatPath := filepath.Join(dir, "chat.log")
+	chatLog, err := openLog(chatPath, 2, "Ada", true, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatLog.turn(time.Millisecond, 1, 1, "secret question", "secret answer")
+	chatLog.close()
+	b, err = os.ReadFile(chatPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "secret question") {
+		t.Fatalf("logchat did not keep the text: %s", b)
+	}
+}
+
+func TestConfigPrecedence(t *testing.T) {
+	model := "fromfile"
+	themeName := "green"
+	width := 40
+	got, themeSet, err := applyConfig(defaultOptions(), config.File{
+		Model: &model,
+		Theme: &themeName,
+		Width: &width,
+	})
+	if err != nil || !themeSet {
+		t.Fatal(err)
+	}
+	if got.model != "fromfile" || got.width != 40 || got.theme != "green" {
+		t.Fatalf("config %+v", got)
+	}
+	if got.host != "http://localhost:11434" || got.system != defaultSystem {
+		t.Fatal("defaults were dropped")
+	}
+	got = applyFlags(got, map[string]bool{"model": true, "width": true}, flagOptions{
+		model: "fromflag",
+		width: 33,
+		theme: "mono",
+	})
+	if got.model != "fromflag" || got.width != 33 || got.theme != "green" {
+		t.Fatalf("flags %+v", got)
+	}
+}
+
+func TestConfigFileSuppliesModel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(path, []byte(`{"model":"fromcfg","width":40}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := realMain(context.Background(),
+		[]string{"-config", path, "-theme", "mono", "-idle", "0"},
+		strings.NewReader("quit\n"),
+		&out, &errOut,
+	)
+	if code != 0 {
+		t.Fatalf("code %d stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "model=fromcfg") || !strings.Contains(errOut.String(), "width=40") {
+		t.Fatalf("stderr %q", errOut.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.\r\n") {
+		t.Fatalf("out %q", out.String())
 	}
 }
 

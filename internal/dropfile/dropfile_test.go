@@ -19,32 +19,32 @@ func TestParse(t *testing.T) {
 		{
 			name: "door32 spec sample",
 			file: "testdata/door32.sys",
-			want: Info{Alias: "g00r00", ANSI: true, MinutesLeft: 58, HasLimit: true},
+			want: Info{Alias: "g00r00", ANSI: true, MinutesLeft: 58, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door32 crlf lowercase",
 			file: "testdata/crlf/door32.sys",
-			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 60, HasLimit: true},
+			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 60, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door32 mixed-case name",
 			file: "testdata/Door32.Sys",
-			want: Info{Alias: "Case", ANSI: true, MinutesLeft: 9, HasLimit: true},
+			want: Info{Alias: "Case", ANSI: true, MinutesLeft: 9, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door32 ascii emulation",
 			file: "testdata/ascii/door32.sys",
-			want: Info{Alias: "PlainUser", ANSI: false, MinutesLeft: 15, HasLimit: true},
+			want: Info{Alias: "PlainUser", ANSI: false, MinutesLeft: 15, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door32 avatar falls back to ansi",
 			file: "testdata/avatar/door32.sys",
-			want: Info{Alias: "Ava", ANSI: true, MinutesLeft: 20, HasLimit: true},
+			want: Info{Alias: "Ava", ANSI: true, MinutesLeft: 20, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door.sys 52 lines",
 			file: "testdata/DOOR.SYS",
-			want: Info{Alias: "Stud", ANSI: true, MinutesLeft: 126, HasLimit: true},
+			want: Info{Alias: "Stud", ANSI: true, MinutesLeft: 126, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door.sys short file uses line 10",
@@ -69,7 +69,7 @@ func TestParse(t *testing.T) {
 		{
 			name: "shipped example",
 			file: filepath.Join("..", "..", "examples", "door32.sys"),
-			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 60, HasLimit: true},
+			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 60, HasLimit: true, Node: 1},
 		},
 	}
 
@@ -129,7 +129,7 @@ func TestParseRIPAndMax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !got.ANSI || got.Alias != "Rip" || got.MinutesLeft != 8 || !got.HasLimit {
+		if !got.ANSI || got.Alias != "Rip" || got.MinutesLeft != 8 || !got.HasLimit || got.Node != 1 {
 			t.Fatalf("emu %d: %+v", emu, got)
 		}
 	}
@@ -172,19 +172,19 @@ func TestParseMinutesLimit(t *testing.T) {
 			name: "door32 zero is a limit",
 			base: "door32.sys",
 			body: "2\n0\n38400\nSynchronet\n1\nJosh\nJosh\n10\n0\n1\n1\n",
-			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 0, HasLimit: true},
+			want: Info{Alias: "Josh", ANSI: true, MinutesLeft: 0, HasLimit: true, Node: 1},
 		},
 		{
 			name: "door32 blank minutes is no limit",
 			base: "door32.sys",
 			body: "2\n0\n38400\nSynchronet\n1\nJosh\nJosh\n10\n\n1\n1\n",
-			want: Info{Alias: "Josh", ANSI: true},
+			want: Info{Alias: "Josh", ANSI: true, Node: 1},
 		},
 		{
 			name: "door32 garbage minutes is no limit",
 			base: "DOOR32.SYS",
 			body: "2\n0\n38400\nSynchronet\n1\nJosh\nJosh\n10\nsoon\n0\n1\n",
-			want: Info{Alias: "Josh", ANSI: false},
+			want: Info{Alias: "Josh", ANSI: false, Node: 1},
 		},
 		{
 			name: "door.sys zero is a limit",
@@ -226,6 +226,30 @@ func blankDoorSys(n int, value string) string {
 	lines[9] = "Pat"
 	lines[n-1] = value
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func TestNodeNumber(t *testing.T) {
+	door32, err := Parse("testdata/door32.sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if door32.Node != 1 {
+		t.Fatalf("DOOR32.SYS line 11: node %d", door32.Node)
+	}
+	door, err := Parse("testdata/DOOR.SYS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if door.Node != 1 {
+		t.Fatalf("DOOR.SYS line 4: node %d", door.Node)
+	}
+	short, err := Parse("testdata/short/door.sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.Node != 0 {
+		t.Fatalf("non-numeric node: %d", short.Node)
+	}
 }
 
 func TestParseMissing(t *testing.T) {
